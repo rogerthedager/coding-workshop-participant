@@ -1,7 +1,7 @@
 """Facility incidents, lifecycle, communication and escalation endpoints."""
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
@@ -11,6 +11,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
 from ..dependencies import current_user
+from ..enums import (
+    BLOCKED_REASONS,
+    FINAL_STATUSES,
+    PRIORITY_RANK,
+    VALID_TRANSITIONS,
+    AssigneeFilter,
+    BlockedReason,
+    EscalationFilter,
+    EscalationState,
+    IncidentEventType,
+    IncidentPriority,
+    IncidentScope,
+    IncidentSort,
+    IncidentStatus,
+    NoteVisibility,
+    SortDirection,
+    UserRole,
+)
 from ..models import (
     Building,
     Category,
@@ -37,18 +55,6 @@ from ..permissions import (
 )
 
 router = APIRouter(tags=["incidents"])
-Priority = Literal["Critical", "High", "Medium", "Low"]
-Status = Literal["Open", "In Progress", "Blocked", "Resolved", "Closed", "Cancelled"]
-Visibility = Literal["public", "internal"]
-EscalationState = Literal["Pending", "Approved", "Rejected", "Superseded", "none"]
-PRIORITY_RANK = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
-BLOCKED_REASONS = {
-    "Waiting on parts",
-    "Waiting on employee",
-    "Vendor needed",
-    "Access needed",
-    "Other",
-}
 Db = Annotated[AsyncSession, Depends(get_db)]
 Actor = Annotated[User, Depends(current_user)]
 Version = Annotated[str | None, Header(alias="If-Match")]
@@ -67,7 +73,7 @@ class IncidentCreate(Payload):
     building_id: UUID
     floor_id: UUID
     seat_id: UUID | None = None
-    requested_priority: Priority = "Medium"
+    requested_priority: IncidentPriority = IncidentPriority.MEDIUM
 
 
 class IncidentPatch(Payload):
@@ -85,20 +91,20 @@ class Assignment(Payload):
 
 
 class PriorityChange(Payload):
-    priority: Priority
+    priority: IncidentPriority
     reason: str = Field(min_length=1, max_length=500)
 
 
 class Transition(Payload):
-    status: Status
+    status: IncidentStatus
     reason: str | None = Field(default=None, min_length=1, max_length=500)
     note: str | None = Field(default=None, min_length=1, max_length=5000)
-    visibility: Visibility = "public"
+    visibility: NoteVisibility = NoteVisibility.PUBLIC
 
 
 class NoteCreate(Payload):
     body: str = Field(min_length=1, max_length=5000)
-    visibility: Visibility = "public"
+    visibility: NoteVisibility = NoteVisibility.PUBLIC
 
 
 class NotePatch(Payload):
@@ -115,7 +121,7 @@ class EscalationCreate(Payload):
 
 class EscalationDecision(Payload):
     approved: bool
-    priority: Priority | None = None
+    priority: IncidentPriority | None = None
     decision_reason: str | None = Field(default=None, min_length=1, max_length=500)
     action_plan: str | None = Field(default=None, min_length=1, max_length=5000)
     assigned_to: UUID | None = None
@@ -193,12 +199,14 @@ async def incident_projection(db: AsyncSession, incident: Incident, user: User) 
         )
     latest = await _latest_escalation(db, incident.id)
     result["latest_escalation"] = _escalation_projection(latest)
-    if latest and latest.state in {"Approved", "Rejected"}:
+    if latest and latest.state in {EscalationState.APPROVED, EscalationState.REJECTED}:
         decision = await db.scalar(
             select(IncidentEvent)
             .where(
                 IncidentEvent.incident_id == incident.id,
-                IncidentEvent.type.in_(["escalation_approved", "escalation_rejected"]),
+                IncidentEvent.type.in_(
+                    [IncidentEventType.ESCALATION_APPROVED, IncidentEventType.ESCALATION_REJECTED]
+                ),
                 IncidentEvent.payload["escalation_id"].astext == str(latest.id),
             )
             .order_by(IncidentEvent.created_at.desc())
@@ -211,7 +219,7 @@ async def incident_projection(db: AsyncSession, incident: Incident, user: User) 
             if note is None or note.hidden_at is not None:
                 result["latest_escalation"]["decision_reason"] = None
                 result["latest_escalation"]["action_plan"] = None
-            elif latest.state == "Rejected":
+            elif latest.state == EscalationState.REJECTED:
                 result["latest_escalation"]["decision_reason"] = note.body
             elif latest.action_plan:
                 result["latest_escalation"]["action_plan"] = note.body
@@ -307,7 +315,7 @@ async def _active_engineer(db: AsyncSession, user_id: UUID) -> EngineerProfile:
     if (
         account is None
         or not account.is_active
-        or "engineer" not in (account.roles or [])
+        or UserRole.ENGINEER not in (account.roles or [])
         or profile is None
         or not profile.is_active
     ):
@@ -336,9 +344,9 @@ def note_projection(note: IncidentNote) -> dict[str, Any]:
 
 
 async def _add_note(
-    db: AsyncSession, incident: Incident, user: User, body: str, visibility: str
+    db: AsyncSession, incident: Incident, user: User, body: str, visibility: NoteVisibility
 ) -> IncidentNote:
-    require_permission(visibility == "public" or can_staff(user, incident))
+    require_permission(visibility == NoteVisibility.PUBLIC or can_staff(user, incident))
     note = IncidentNote(
         incident_id=incident.id, author_id=user.id, body=body, visibility=visibility
     )
@@ -348,10 +356,10 @@ async def _add_note(
         db,
         incident,
         user,
-        "note_added",
+        IncidentEventType.NOTE_ADDED,
         {"note_id": str(note.id), "visibility": visibility},
     )
-    if visibility == "public" and incident.assigned_to == user.id:
+    if visibility == NoteVisibility.PUBLIC and incident.assigned_to == user.id:
         incident.acknowledged_at = incident.acknowledged_at or utcnow()
     return note
 
@@ -369,7 +377,7 @@ async def _assign(
     if previous is not None and not reason:
         raise HTTPException(422, "Reassignment or unassignment requires a reason")
     if assigned_to is None:
-        if incident.status != "Open":
+        if incident.status != IncidentStatus.OPEN:
             raise HTTPException(409, "Only Open incidents may be unassigned")
         if not reason:
             raise HTTPException(422, "Unassignment requires a reason")
@@ -381,7 +389,7 @@ async def _assign(
         db,
         incident,
         user,
-        "assigned" if assigned_to else "unassigned",
+        IncidentEventType.ASSIGNED if assigned_to else IncidentEventType.UNASSIGNED,
         {
             "previous_assignee": str(previous) if previous else None,
             "assignee": str(assigned_to) if assigned_to else None,
@@ -395,12 +403,12 @@ async def _supersede_pending(db: AsyncSession, incident: Incident, user: User) -
         select(EscalationRequest)
         .where(
             EscalationRequest.incident_id == incident.id,
-            EscalationRequest.state == "Pending",
+            EscalationRequest.state == EscalationState.PENDING,
         )
         .with_for_update()
     )
     if pending is not None:
-        pending.state = "Superseded"
+        pending.state = EscalationState.SUPERSEDED
         pending.decided_at = utcnow()
         pending.decided_by = user.id
         pending.decision_reason = f"Incident became {incident.status}"
@@ -408,7 +416,7 @@ async def _supersede_pending(db: AsyncSession, incident: Incident, user: User) -
             db,
             incident,
             user,
-            "escalation_superseded",
+            IncidentEventType.ESCALATION_SUPERSEDED,
             {"escalation_id": str(pending.id), "reason": pending.decision_reason},
         )
 
@@ -426,12 +434,18 @@ async def create_incident(
         **payload.model_dump(),
         number=f"INC-{number:06d}",
         created_by=user.id,
-        status="Open",
+        status=IncidentStatus.OPEN,
         priority=payload.requested_priority,
     )
     db.add(incident)
     await db.flush()
-    event(db, incident, user, "created", {"status": "Open", "priority": incident.priority})
+    event(
+        db,
+        incident,
+        user,
+        IncidentEventType.CREATED,
+        {"status": IncidentStatus.OPEN, "priority": incident.priority},
+    )
     return await _finish(db, incident, user, response)
 
 
@@ -441,21 +455,21 @@ async def list_incidents(
     db: Db,
     user: Actor,
     q: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
-    status: Annotated[list[Status] | None, Query()] = None,
-    priority: Annotated[list[Priority] | None, Query()] = None,
+    status: Annotated[list[IncidentStatus] | None, Query()] = None,
+    priority: Annotated[list[IncidentPriority] | None, Query()] = None,
     category_id: UUID | None = None,
     building_id: UUID | None = None,
     floor_id: UUID | None = None,
     seat_id: UUID | None = None,
-    assigned_to: UUID | Literal["unassigned"] | None = None,
+    assigned_to: UUID | AssigneeFilter | None = None,
     created_by: UUID | None = None,
-    escalation: EscalationState | None = None,
-    scope: Literal["all", "mine", "assigned"] = "all",
+    escalation: EscalationState | EscalationFilter | None = None,
+    scope: IncidentScope = IncidentScope.ALL,
     unassigned: bool = False,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
-    sort: Literal["created", "updated", "priority"] = "created",
-    direction: Literal["asc", "desc"] = "desc",
+    sort: IncidentSort = IncidentSort.CREATED,
+    direction: SortDirection = SortDirection.DESC,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
 ) -> dict[str, Any]:
@@ -484,7 +498,7 @@ async def list_incidents(
         raise HTTPException(422, "Unsupported incident filter")
     if created_by is not None:
         require_permission(is_admin(user))
-    if unassigned and assigned_to not in {None, "unassigned"}:
+    if unassigned and assigned_to not in {None, AssigneeFilter.UNASSIGNED}:
         raise HTTPException(422, "Unassigned and assigned_to filters conflict")
     for bound in (date_from, date_to):
         if bound is not None and bound.tzinfo is None:
@@ -492,10 +506,10 @@ async def list_incidents(
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from must not exceed date_to")
     conditions = [readable_clause(user)]
-    if scope == "mine":
+    if scope == IncidentScope.MINE:
         conditions.append(Incident.created_by == user.id)
-    elif scope == "assigned":
-        require_permission(is_admin(user) or "engineer" in (user.roles or []))
+    elif scope == IncidentScope.ASSIGNED:
+        require_permission(is_admin(user) or UserRole.ENGINEER in (user.roles or []))
         conditions.append(Incident.assigned_to == user.id)
     if q:
         document = func.to_tsvector(
@@ -516,7 +530,7 @@ async def list_incidents(
         (Incident.building_id, building_id),
         (Incident.floor_id, floor_id),
         (Incident.seat_id, seat_id),
-        (Incident.assigned_to, assigned_to if assigned_to != "unassigned" else None),
+        (Incident.assigned_to, assigned_to if assigned_to != AssigneeFilter.UNASSIGNED else None),
         (Incident.created_by, created_by),
     ):
         if value is not None:
@@ -526,7 +540,7 @@ async def list_incidents(
         conditions.append(
             or_(Incident.category_id == category_id, Incident.category_id.in_(children))
         )
-    if unassigned or assigned_to == "unassigned":
+    if unassigned or assigned_to == AssigneeFilter.UNASSIGNED:
         conditions.append(Incident.assigned_to.is_(None))
     if date_from:
         conditions.append(Incident.created_at >= date_from)
@@ -542,17 +556,19 @@ async def list_incidents(
             .scalar_subquery()
         )
         conditions.append(
-            latest_state.is_(None) if escalation == "none" else latest_state == escalation
+            latest_state.is_(None)
+            if escalation == EscalationFilter.NONE
+            else latest_state == escalation
         )
     sort_column = {
-        "created": Incident.created_at,
-        "updated": Incident.updated_at,
-        "priority": case(PRIORITY_RANK, value=Incident.priority, else_=0),
+        IncidentSort.CREATED: Incident.created_at,
+        IncidentSort.UPDATED: Incident.updated_at,
+        IncidentSort.PRIORITY: case(PRIORITY_RANK, value=Incident.priority, else_=0),
     }[sort]
-    order = sort_column.asc() if direction == "asc" else sort_column.desc()
+    order = sort_column.asc() if direction == SortDirection.ASC else sort_column.desc()
     tie_break = (
         [Incident.created_at.asc(), Incident.id.asc()]
-        if sort == "priority"
+        if sort == IncidentSort.PRIORITY
         else [Incident.id.asc()]
     )
     total = await db.scalar(select(func.count()).select_from(Incident).where(*conditions))
@@ -595,7 +611,7 @@ async def update_incident(
     incident = await load_incident(db, user, incident_id, lock=True)
     require_permission(can_staff(user, incident) or incident.created_by == user.id)
     require_nonfinal(incident)
-    if not can_staff(user, incident) and incident.status != "Open":
+    if not can_staff(user, incident) and incident.status != IncidentStatus.OPEN:
         raise HTTPException(409, "Creators may edit details only while Open")
     check_match(incident, if_match)
     changes = payload.model_dump(exclude_unset=True)
@@ -617,7 +633,7 @@ async def update_incident(
     for key, value in changes.items():
         setattr(incident, key, value)
     touch(incident)
-    event(db, incident, user, "details_changed", {"fields": sorted(changes)})
+    event(db, incident, user, IncidentEventType.DETAILS_CHANGED, {"fields": sorted(changes)})
     return await _finish(db, incident, user, response)
 
 
@@ -661,7 +677,7 @@ async def change_priority(
         db,
         incident,
         user,
-        "priority_changed",
+        IncidentEventType.PRIORITY_CHANGED,
         {"from": previous, "to": incident.priority, "reason": payload.reason},
     )
     return await _finish(db, incident, user, response)
@@ -681,9 +697,9 @@ async def transition_incident(
     creator = incident.created_by == user.id
     staff = can_staff(user, incident)
     if (
-        payload.status in {"Closed", "Cancelled"}
-        or payload.status == "In Progress"
-        and incident.status == "Resolved"
+        payload.status in FINAL_STATUSES
+        or payload.status == IncidentStatus.IN_PROGRESS
+        and incident.status == IncidentStatus.RESOLVED
     ):
         require_permission(is_admin(user) or creator)
     else:
@@ -692,72 +708,69 @@ async def transition_incident(
     check_match(incident, if_match)
     previous = incident.status
     target = payload.status
-    valid = {
-        ("Open", "In Progress"),
-        ("Open", "Cancelled"),
-        ("In Progress", "Blocked"),
-        ("Blocked", "In Progress"),
-        ("In Progress", "Resolved"),
-        ("Resolved", "Closed"),
-        ("Resolved", "In Progress"),
-    }
-    if (previous, target) not in valid:
+    if (previous, target) not in VALID_TRANSITIONS:
         raise HTTPException(409, "Invalid incident transition")
     now = utcnow()
     extra: dict[str, Any] = {}
-    if target == "Cancelled":
+    if target == IncidentStatus.CANCELLED:
         if not is_admin(user) and incident.assigned_to is not None:
             raise HTTPException(403, "Creators may cancel only unassigned incidents")
         if not payload.reason:
             raise HTTPException(422, "Cancellation requires a reason")
         incident.cancelled_at = now
         extra["reason"] = payload.reason
-    elif previous == "Open" and target == "In Progress":
+    elif previous == IncidentStatus.OPEN and target == IncidentStatus.IN_PROGRESS:
         if incident.assigned_to is None:
             raise HTTPException(409, "Assign an engineer before starting work")
         incident.first_in_progress_at = incident.first_in_progress_at or now
         incident.acknowledged_at = incident.acknowledged_at or now
-    elif target == "Blocked":
+    elif target == IncidentStatus.BLOCKED:
         if payload.reason not in BLOCKED_REASONS:
             raise HTTPException(422, "A valid blocked reason code is required")
         if not payload.note:
             raise HTTPException(422, "Blocking requires a note")
         note = await _add_note(db, incident, user, payload.note, payload.visibility)
-        incident.blocked_reason = payload.reason
+        incident.blocked_reason = BlockedReason(payload.reason)
         incident.blocked_since = now
         extra.update(reason=payload.reason, note_id=str(note.id), visibility=payload.visibility)
-    elif previous == "Blocked":
+    elif previous == IncidentStatus.BLOCKED:
         extra.update(reason=incident.blocked_reason, blocked_since=_iso(incident.blocked_since))
         incident.blocked_reason = None
         incident.blocked_since = None
-    elif target == "Resolved":
-        if not payload.note or payload.visibility != "public":
+    elif target == IncidentStatus.RESOLVED:
+        if not payload.note or payload.visibility != NoteVisibility.PUBLIC:
             raise HTTPException(422, "Resolution requires a public note")
-        note = await _add_note(db, incident, user, payload.note, "public")
+        note = await _add_note(db, incident, user, payload.note, NoteVisibility.PUBLIC)
         incident.resolved_at = now
         extra.update(
             note_id=str(note.id),
             assignee=str(incident.assigned_to),
             assigned_to=str(incident.assigned_to),
-            visibility="public",
+            visibility=NoteVisibility.PUBLIC,
         )
-    elif target == "Closed":
+    elif target == IncidentStatus.CLOSED:
         incident.closed_at = now
-    elif previous == "Resolved":
-        if not payload.note or payload.visibility != "public":
+    elif previous == IncidentStatus.RESOLVED:
+        if not payload.note or payload.visibility != NoteVisibility.PUBLIC:
             raise HTTPException(422, "Rejecting a resolution requires a public note")
-        note = await _add_note(db, incident, user, payload.note, "public")
+        note = await _add_note(db, incident, user, payload.note, NoteVisibility.PUBLIC)
         extra.update(
             note_id=str(note.id),
             previous_resolved_at=_iso(incident.resolved_at),
-            visibility="public",
+            visibility=NoteVisibility.PUBLIC,
         )
         incident.resolved_at = None
         incident.reopen_count += 1
     incident.status = target
     touch(incident)
-    event(db, incident, user, "status_changed", {"from": previous, "to": target, **extra})
-    if target in {"Closed", "Cancelled"}:
+    event(
+        db,
+        incident,
+        user,
+        IncidentEventType.STATUS_CHANGED,
+        {"from": previous, "to": target, **extra},
+    )
+    if target in FINAL_STATUSES:
         await _supersede_pending(db, incident, user)
     return await _finish(db, incident, user, response)
 
@@ -776,7 +789,7 @@ async def request_escalation(
     require_nonfinal(incident)
     check_match(incident, if_match)
     latest = await _latest_escalation(db, incident.id)
-    if latest and latest.state == "Pending":
+    if latest and latest.state == EscalationState.PENDING:
         raise HTTPException(409, "An escalation request is already pending")
     now = utcnow()
     if latest and now < _aware(latest.requested_at) + timedelta(hours=24):
@@ -786,7 +799,7 @@ async def request_escalation(
         requester_id=user.id,
         reason=payload.reason,
         requested_at=now,
-        state="Pending",
+        state=EscalationState.PENDING,
     )
     db.add(entry)
     await db.flush()
@@ -795,7 +808,7 @@ async def request_escalation(
         db,
         incident,
         user,
-        "escalation_requested",
+        IncidentEventType.ESCALATION_REQUESTED,
         {"escalation_id": str(entry.id), "reason": payload.reason},
     )
     return await _finish(db, incident, user, response)
@@ -818,7 +831,7 @@ async def decide_escalation(
         select(EscalationRequest)
         .where(
             EscalationRequest.incident_id == incident.id,
-            EscalationRequest.state == "Pending",
+            EscalationRequest.state == EscalationState.PENDING,
         )
         .with_for_update()
     )
@@ -826,12 +839,14 @@ async def decide_escalation(
         raise HTTPException(409, "No pending escalation request")
     decision_note = None
     if payload.approved:
-        if incident.priority == "Critical":
+        if incident.priority == IncidentPriority.CRITICAL:
             if not payload.action_plan:
                 raise HTTPException(422, "Critical approval requires a public action plan")
-            if payload.priority not in {None, "Critical"}:
+            if payload.priority not in {None, IncidentPriority.CRITICAL}:
                 raise HTTPException(422, "Critical escalation cannot lower priority")
-            decision_note = await _add_note(db, incident, user, payload.action_plan, "public")
+            decision_note = await _add_note(
+                db, incident, user, payload.action_plan, NoteVisibility.PUBLIC
+            )
         else:
             if (
                 payload.priority is None
@@ -844,7 +859,7 @@ async def decide_escalation(
                 db,
                 incident,
                 user,
-                "priority_changed",
+                IncidentEventType.PRIORITY_CHANGED,
                 {
                     "from": previous,
                     "to": incident.priority,
@@ -852,15 +867,19 @@ async def decide_escalation(
                 },
             )
             if payload.action_plan:
-                decision_note = await _add_note(db, incident, user, payload.action_plan, "public")
-        entry.state = "Approved"
+                decision_note = await _add_note(
+                    db, incident, user, payload.action_plan, NoteVisibility.PUBLIC
+                )
+        entry.state = EscalationState.APPROVED
     else:
         if not payload.decision_reason:
             raise HTTPException(422, "Rejection requires a public reason")
         if payload.priority is not None or payload.action_plan is not None:
             raise HTTPException(422, "Rejection accepts only its reason and optional reassignment")
-        decision_note = await _add_note(db, incident, user, payload.decision_reason, "public")
-        entry.state = "Rejected"
+        decision_note = await _add_note(
+            db, incident, user, payload.decision_reason, NoteVisibility.PUBLIC
+        )
+        entry.state = EscalationState.REJECTED
     if "assigned_to" in payload.model_fields_set:
         await _assign(
             db,
@@ -878,13 +897,15 @@ async def decide_escalation(
         db,
         incident,
         user,
-        "escalation_approved" if payload.approved else "escalation_rejected",
+        IncidentEventType.ESCALATION_APPROVED
+        if payload.approved
+        else IncidentEventType.ESCALATION_REJECTED,
         {
             "escalation_id": str(entry.id),
             "reason": payload.decision_reason,
             "priority": incident.priority,
             "note_id": str(decision_note.id) if decision_note else None,
-            "visibility": "public",
+            "visibility": NoteVisibility.PUBLIC,
         },
     )
     return await _finish(db, incident, user, response)
@@ -895,7 +916,7 @@ async def list_notes(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]:
     incident = await load_incident(db, user, incident_id)
     statement = select(IncidentNote).where(IncidentNote.incident_id == incident.id)
     if not can_staff(user, incident):
-        statement = statement.where(IncidentNote.visibility == "public")
+        statement = statement.where(IncidentNote.visibility == NoteVisibility.PUBLIC)
     notes = (await db.scalars(statement.order_by(IncidentNote.created_at, IncidentNote.id))).all()
     return {"items": [note_projection(note) for note in notes], "total": len(notes)}
 
@@ -910,7 +931,7 @@ async def create_note(
     if_match: Version = None,
 ) -> dict[str, Any]:
     incident = await load_incident(db, user, incident_id, lock=True)
-    require_permission(payload.visibility == "public" or can_staff(user, incident))
+    require_permission(payload.visibility == NoteVisibility.PUBLIC or can_staff(user, incident))
     require_nonfinal(incident)
     check_match(incident, if_match)
     note = await _add_note(db, incident, user, payload.body, payload.visibility)
@@ -938,7 +959,9 @@ async def _load_note(db: AsyncSession, user: User, note_id: UUID) -> tuple[Incid
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if note is None or (note.visibility == "internal" and not can_staff(user, incident)):
+    if note is None or (
+        note.visibility == NoteVisibility.INTERNAL and not can_staff(user, incident)
+    ):
         raise HTTPException(404, "Note not found")
     return incident, note
 
@@ -954,7 +977,7 @@ async def edit_note(
 ) -> dict[str, Any]:
     incident, note = await _load_note(db, user, note_id)
     require_permission(note.author_id == user.id)
-    require_permission(note.visibility == "public" or can_staff(user, incident))
+    require_permission(note.visibility == NoteVisibility.PUBLIC or can_staff(user, incident))
     require_nonfinal(incident)
     check_match(note, if_match)
     if note.hidden_at is not None:
@@ -972,7 +995,7 @@ async def edit_note(
         db,
         incident,
         user,
-        "note_edited",
+        IncidentEventType.NOTE_EDITED,
         {
             "note_id": str(note.id),
             "visibility": note.visibility,
@@ -1010,7 +1033,7 @@ async def hide_note(
             db,
             incident,
             user,
-            "note_hidden",
+            IncidentEventType.NOTE_HIDDEN,
             {
                 "note_id": str(note.id),
                 "visibility": note.visibility,
@@ -1060,21 +1083,26 @@ async def get_timeline(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]
     for entry in events:
         stored = entry.payload or {}
         note = by_id.get(str(stored.get("note_id")))
-        if entry.type.startswith("note_") and (
-            note is None or (note.visibility == "internal" and not staff)
-        ):
+        if entry.type in {
+            IncidentEventType.NOTE_ADDED,
+            IncidentEventType.NOTE_EDITED,
+            IncidentEventType.NOTE_HIDDEN,
+        } and (note is None or (note.visibility == NoteVisibility.INTERNAL and not staff)):
             continue
         payload = {key: value for key, value in stored.items() if key in safe_keys}
-        if stored.get("visibility") == "internal" and not staff:
+        if stored.get("visibility") == NoteVisibility.INTERNAL and not staff:
             # Workflow status itself is public; its note identity/visibility is not.
             payload.pop("note_id", None)
             payload.pop("visibility", None)
         if note is not None and note.hidden_at is not None:
             payload["hidden"] = True
         # Hide reasons are retained for admin auditing, not public disclosure.
-        if entry.type == "note_hidden" and not is_admin(user):
+        if entry.type == IncidentEventType.NOTE_HIDDEN and not is_admin(user):
             payload.pop("reason", None)
-        if entry.type in {"escalation_approved", "escalation_rejected"}:
+        if entry.type in {
+            IncidentEventType.ESCALATION_APPROVED,
+            IncidentEventType.ESCALATION_REJECTED,
+        }:
             # Decision prose is shown through its hide-aware public note or
             # escalation projection, never duplicated in ordinary audit events.
             payload.pop("reason", None)
@@ -1088,7 +1116,7 @@ async def get_timeline(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]
                 "created_at": _iso(entry.created_at),
                 **(
                     {"note": note_projection(note)}
-                    if entry.type == "note_added" and note is not None
+                    if entry.type == IncidentEventType.NOTE_ADDED and note is not None
                     else {}
                 ),
             }

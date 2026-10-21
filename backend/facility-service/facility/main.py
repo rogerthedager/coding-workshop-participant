@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from facility.config import settings
 from facility.database import SessionLocal
+from facility.enums import APIErrorCode
 from facility.routers import auth, dashboards, facilities, incidents, people
 
 logger = logging.getLogger("facility.requests")
@@ -37,22 +38,22 @@ app.add_middleware(
 def error_response(status: int, message: str, details: object = None) -> JSONResponse:
     """Produce the public error contract without raw input or SQL text."""
     codes = {
-        401: "unauthenticated",
-        403: "forbidden",
-        404: "not_found",
-        409: "conflict",
-        422: "validation_error",
-        428: "precondition_required",
-        429: "locked",
-        503: "unavailable",
-        500: "internal_error",
+        401: APIErrorCode.UNAUTHENTICATED,
+        403: APIErrorCode.FORBIDDEN,
+        404: APIErrorCode.NOT_FOUND,
+        409: APIErrorCode.CONFLICT,
+        422: APIErrorCode.VALIDATION_ERROR,
+        428: APIErrorCode.PRECONDITION_REQUIRED,
+        429: APIErrorCode.LOCKED,
+        503: APIErrorCode.UNAVAILABLE,
+        500: APIErrorCode.INTERNAL_ERROR,
     }
     return JSONResponse(
         status_code=status,
         content=jsonable_encoder(
             {
                 "error": {
-                    "code": codes.get(status, "request_error"),
+                    "code": codes.get(status, APIErrorCode.REQUEST_ERROR),
                     "message": message,
                     "details": details or {},
                 }

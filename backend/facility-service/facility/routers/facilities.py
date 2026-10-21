@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from facility.database import get_db
 from facility.dependencies import current_user, require_admin
+from facility.enums import FINAL_STATUSES
 from facility.models import Building, Category, Floor, Incident, Seat, User
 
 router = APIRouter(tags=["facilities"], dependencies=[Depends(current_user)])
-FINAL = ["Closed", "Cancelled"]
 
 
 class Input(BaseModel):
@@ -104,7 +104,9 @@ async def get_locked(db: AsyncSession, model: Any, item_id: UUID) -> Any:
 async def guard_location(db: AsyncSession, condition: Any) -> None:
     """Disallow location deactivation while any non-final ticket references it."""
     count = await db.scalar(
-        select(func.count()).select_from(Incident).where(condition, Incident.status.not_in(FINAL))
+        select(func.count())
+        .select_from(Incident)
+        .where(condition, Incident.status.not_in(FINAL_STATUSES))
     )
     if count:
         raise HTTPException(409, {"message": "Location has non-final incidents", "count": count})

@@ -8,6 +8,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from facility.database import get_db
+from facility.enums import UserRole
 from facility.models import User
 from facility.security import decode_access_token
 
@@ -41,6 +42,6 @@ async def current_user(user: Annotated[User, Depends(authenticated_user)]) -> Us
 
 async def require_admin(user: Annotated[User, Depends(current_user)]) -> User:
     """Require an additive admin role from the current database row."""
-    if "admin" not in user.roles:
+    if UserRole.ADMIN not in user.roles:
         raise HTTPException(403, "Administrator access required")
     return user

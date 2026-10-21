@@ -16,9 +16,20 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from facility.database import Base
+from facility.db_types import TextEnum, UserRolesJSON, enum_check, varchar_enum
+from facility.enums import (
+    BlockedReason,
+    EngineerAvailability,
+    EscalationState,
+    IncidentEventType,
+    IncidentPriority,
+    IncidentStatus,
+    NoteVisibility,
+    UserRole,
+)
 
 
 def utcnow() -> datetime:
@@ -44,16 +55,27 @@ class User(Entity, Base):
         UniqueConstraint("email", name="uq_users_email"),
         CheckConstraint("email = lower(email)", name="ck_users_email_lower"),
         CheckConstraint("jsonb_typeof(roles) = 'array'", name="ck_users_roles_array"),
+        CheckConstraint(
+            "roles <@ '[" + ",".join(f'"{role.value}"' for role in UserRole) + "]'::jsonb",
+            name="ck_users_roles_values",
+        ),
     )
     email: Mapped[str] = mapped_column(String(254), nullable=False)
     full_name: Mapped[str] = mapped_column(String(120), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
-    roles: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
+    roles: Mapped[list[UserRole]] = mapped_column(UserRolesJSON(), default=list, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failed_login_at: Mapped[list[str]] = mapped_column(JSONB, default=list, nullable=False)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @validates("roles")
+    def validate_roles(self, _key: str, value: list[UserRole]) -> list[UserRole]:
+        """Normalize legacy values on assignment and reject unsupported role grants."""
+        if not isinstance(value, list):
+            raise ValueError("Roles must be a list")
+        return [UserRole(role) for role in value]
 
 
 class RefreshSession(Entity, Base):
@@ -77,14 +99,23 @@ class EngineerProfile(Entity, Base):
     __table_args__ = (
         UniqueConstraint("user_id", name="uq_engineer_user"),
         CheckConstraint(
-            "availability IN ('Available','Busy','Off-duty')",
+            enum_check("availability", EngineerAvailability),
             name="ck_engineer_availability",
         ),
     )
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(40))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    availability: Mapped[str] = mapped_column(String(16), default="Available", nullable=False)
+    availability: Mapped[EngineerAvailability] = mapped_column(
+        varchar_enum(EngineerAvailability, 16),
+        default=EngineerAvailability.AVAILABLE,
+        nullable=False,
+    )
+
+    @validates("availability")
+    def validate_availability(self, _key: str, value: EngineerAvailability) -> EngineerAvailability:
+        """Keep workflow code typed even before a profile has been flushed."""
+        return EngineerAvailability(value)
 
 
 class Building(Entity, Base):
@@ -141,18 +172,21 @@ class Incident(Entity, Base):
     __table_args__ = (
         UniqueConstraint("number", name="uq_incidents_number"),
         CheckConstraint(
-            "status IN ('Open','In Progress','Blocked','Resolved','Closed','Cancelled')",
+            enum_check("status", IncidentStatus),
             name="ck_incidents_status",
         ),
         CheckConstraint(
-            "priority IN ('Critical','High','Medium','Low')",
+            enum_check("priority", IncidentPriority),
             name="ck_incidents_priority",
         ),
         CheckConstraint(
-            "requested_priority IN ('Critical','High','Medium','Low')",
+            enum_check("requested_priority", IncidentPriority),
             name="ck_incidents_requested_priority",
         ),
         CheckConstraint("reopen_count >= 0", name="ck_incidents_reopen_count"),
+        CheckConstraint(
+            enum_check("blocked_reason", BlockedReason), name="ck_incidents_blocked_reason"
+        ),
         Index(
             "ix_incidents_search",
             text("to_tsvector('english', title || ' ' || description)"),
@@ -166,12 +200,18 @@ class Incident(Entity, Base):
     building_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("buildings.id"), index=True)
     floor_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("floors.id"), index=True)
     seat_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("seats.id"), index=True)
-    status: Mapped[str] = mapped_column(String(16), default="Open", index=True)
-    requested_priority: Mapped[str] = mapped_column(String(16), default="Medium")
-    priority: Mapped[str] = mapped_column(String(16), default="Medium", index=True)
+    status: Mapped[IncidentStatus] = mapped_column(
+        varchar_enum(IncidentStatus, 16), default=IncidentStatus.OPEN, index=True
+    )
+    requested_priority: Mapped[IncidentPriority] = mapped_column(
+        varchar_enum(IncidentPriority, 16), default=IncidentPriority.MEDIUM
+    )
+    priority: Mapped[IncidentPriority] = mapped_column(
+        varchar_enum(IncidentPriority, 16), default=IncidentPriority.MEDIUM, index=True
+    )
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
     assigned_to: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
-    blocked_reason: Mapped[str | None] = mapped_column(Text)
+    blocked_reason: Mapped[BlockedReason | None] = mapped_column(TextEnum(BlockedReason))
     blocked_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -180,6 +220,23 @@ class Incident(Entity, Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reopen_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    @validates("status")
+    def validate_status(self, _key: str, value: IncidentStatus) -> IncidentStatus:
+        """Expose a shared status member immediately on construction or update."""
+        return IncidentStatus(value)
+
+    @validates("priority", "requested_priority")
+    def validate_priority(self, _key: str, value: IncidentPriority) -> IncidentPriority:
+        """Apply one priority domain to both employee requests and effective urgency."""
+        return IncidentPriority(value)
+
+    @validates("blocked_reason")
+    def validate_blocked_reason(
+        self, _key: str, value: BlockedReason | None
+    ) -> BlockedReason | None:
+        """Use a fixed reason code, retaining absence for incidents that are not blocked."""
+        return None if value is None else BlockedReason(value)
 
 
 Index("ix_incidents_created_at", Incident.created_at)
@@ -191,26 +248,41 @@ class IncidentNote(Entity, Base):
 
     __tablename__ = "incident_notes"
     __table_args__ = (
-        CheckConstraint("visibility IN ('public','internal')", name="ck_notes_visibility"),
+        CheckConstraint(enum_check("visibility", NoteVisibility), name="ck_notes_visibility"),
     )
     incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id"), index=True)
     author_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     body: Mapped[str] = mapped_column(Text)
-    visibility: Mapped[str] = mapped_column(String(16), default="public")
+    visibility: Mapped[NoteVisibility] = mapped_column(
+        varchar_enum(NoteVisibility, 16), default=NoteVisibility.PUBLIC
+    )
     edited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     hidden_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     hide_reason: Mapped[str | None] = mapped_column(Text)
+
+    @validates("visibility")
+    def validate_visibility(self, _key: str, value: NoteVisibility) -> NoteVisibility:
+        """Validate a note audience before authorization uses it."""
+        return NoteVisibility(value)
 
 
 class IncidentEvent(Entity, Base):
     """Append-only sanitized audit payload."""
 
     __tablename__ = "incident_events"
+    __table_args__ = (
+        CheckConstraint(enum_check("type", IncidentEventType), name="ck_incident_events_type"),
+    )
     incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id"), index=True)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
-    type: Mapped[str] = mapped_column(String(48))
+    type: Mapped[IncidentEventType] = mapped_column(varchar_enum(IncidentEventType, 48))
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    @validates("type")
+    def validate_type(self, _key: str, value: IncidentEventType) -> IncidentEventType:
+        """Keep audit categories within the shared event domain."""
+        return IncidentEventType(value)
 
 
 class EscalationRequest(Entity, Base):
@@ -219,22 +291,29 @@ class EscalationRequest(Entity, Base):
     __tablename__ = "escalation_requests"
     __table_args__ = (
         CheckConstraint(
-            "state IN ('Pending','Approved','Rejected','Superseded')",
+            enum_check("state", EscalationState),
             name="ck_escalation_state",
         ),
         Index(
             "uq_pending_escalation",
             "incident_id",
             unique=True,
-            postgresql_where=text("state = 'Pending'"),
+            postgresql_where=text(f"state = '{EscalationState.PENDING.value}'"),
         ),
     )
     incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id"), index=True)
     requester_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     reason: Mapped[str] = mapped_column(Text)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    state: Mapped[str] = mapped_column(String(16), default="Pending")
+    state: Mapped[EscalationState] = mapped_column(
+        varchar_enum(EscalationState, 16), default=EscalationState.PENDING
+    )
     decided_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     decision_reason: Mapped[str | None] = mapped_column(Text)
     action_plan: Mapped[str | None] = mapped_column(Text)
+
+    @validates("state")
+    def validate_state(self, _key: str, value: EscalationState) -> EscalationState:
+        """Normalize escalation states before workflow decisions."""
+        return EscalationState(value)

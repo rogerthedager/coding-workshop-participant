@@ -9,26 +9,27 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
+from .enums import FINAL_STATUSES, IncidentEventType, UserRole
 from .models import Incident, IncidentEvent, User, utcnow
-
-FINAL_STATUSES = frozenset({"Closed", "Cancelled"})
 
 
 def is_admin(user: User) -> bool:
     """Return whether the current database user has the administrator role."""
-    return "admin" in (user.roles or [])
+    return UserRole.ADMIN in (user.roles or [])
 
 
 def can_staff(user: User, incident: Incident) -> bool:
     """Staff permission is scoped to this incident, including additive roles."""
-    return is_admin(user) or ("engineer" in (user.roles or []) and incident.assigned_to == user.id)
+    return is_admin(user) or (
+        UserRole.ENGINEER in (user.roles or []) and incident.assigned_to == user.id
+    )
 
 
 def readable_clause(user: User) -> ColumnElement[bool]:
     """Return a SQL predicate that cannot expose another employee's incident."""
     if is_admin(user):
         return Incident.id.is_not(None)
-    if "engineer" in (user.roles or []):
+    if UserRole.ENGINEER in (user.roles or []):
         return or_(Incident.created_by == user.id, Incident.assigned_to == user.id)
     return Incident.created_by == user.id
 
@@ -84,7 +85,7 @@ def event(
     db: AsyncSession,
     incident: Incident,
     user: User,
-    event_type: str,
+    event_type: IncidentEventType,
     payload: dict[str, Any] | None = None,
 ) -> IncidentEvent:
     """Append a transactional audit event, never log its sensitive payload."""

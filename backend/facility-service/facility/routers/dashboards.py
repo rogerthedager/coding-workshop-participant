@@ -11,6 +11,20 @@ from sqlalchemy.orm import aliased
 
 from facility.database import get_db
 from facility.dependencies import current_user, require_admin
+from facility.enums import (
+    FINAL_STATUSES,
+    NON_FINAL_STATUSES,
+    RESOLVED_STATUSES,
+    AssigneeFilter,
+    EscalationState,
+    IncidentEventType,
+    IncidentScope,
+    IncidentSort,
+    IncidentStatus,
+    NoteVisibility,
+    SortDirection,
+    UserRole,
+)
 from facility.models import (
     Building,
     Category,
@@ -26,7 +40,6 @@ from facility.models import (
 )
 
 router = APIRouter(prefix="/dashboard", tags=["dashboards"])
-FINAL = ["Closed", "Cancelled"]
 
 
 def link(**filters: object) -> str:
@@ -55,7 +68,7 @@ async def communication(db: AsyncSession, *conditions: object) -> list[dict]:
         select(
             IncidentNote.incident_id, func.max(IncidentNote.created_at).label("last_public_update")
         )
-        .where(IncidentNote.visibility == "public", IncidentNote.hidden_at.is_(None))
+        .where(IncidentNote.visibility == NoteVisibility.PUBLIC, IncidentNote.hidden_at.is_(None))
         .group_by(IncidentNote.incident_id)
         .subquery()
     )
@@ -87,12 +100,12 @@ async def employee_dashboard(
     owned = Incident.created_by == user.id
     counts = await grouped(db, Incident.status, owned)
     for count in counts:
-        count["href"] = link(status=count["value"], scope="mine")
+        count["href"] = link(status=count["value"], scope=IncidentScope.MINE)
     awaiting = (
         (
             await db.execute(
                 select(Incident.id, Incident.number, Incident.title, Incident.resolved_at)
-                .where(owned, Incident.status == "Resolved")
+                .where(owned, Incident.status == IncidentStatus.RESOLVED)
                 .order_by(Incident.resolved_at, Incident.id)
             )
         )
@@ -104,7 +117,11 @@ async def employee_dashboard(
             IncidentNote.id, IncidentNote.incident_id, IncidentNote.body, IncidentNote.created_at
         )
         .join(Incident, Incident.id == IncidentNote.incident_id)
-        .where(owned, IncidentNote.visibility == "public", IncidentNote.hidden_at.is_(None))
+        .where(
+            owned,
+            IncidentNote.visibility == NoteVisibility.PUBLIC,
+            IncidentNote.hidden_at.is_(None),
+        )
         .order_by(IncidentNote.created_at.desc(), IncidentNote.id)
         .limit(10)
     )
@@ -112,7 +129,7 @@ async def employee_dashboard(
         "status_counts": counts,
         "awaiting_confirmation": [dict(row) for row in awaiting],
         "recent_public_notes": [dict(row) for row in recent.mappings()],
-        "communication": await communication(db, owned, Incident.status.not_in(FINAL)),
+        "communication": await communication(db, owned, Incident.status.not_in(FINAL_STATUSES)),
     }
 
 
@@ -124,7 +141,7 @@ async def engineer_dashboard(
     user: User = Depends(current_user),
 ) -> dict:
     """Aggregate current assignment and resolution-event attributed work."""
-    if "engineer" not in user.roles:
+    if UserRole.ENGINEER not in user.roles:
         raise HTTPException(403, "Engineer role required")
     profile = await db.scalar(
         select(EngineerProfile).where(
@@ -141,11 +158,12 @@ async def engineer_dashboard(
     if start.tzinfo is None or end.tzinfo is None or end <= start:
         raise HTTPException(422, "Supply timezone-aware week_start and week_end")
     assigned = Incident.assigned_to == user.id
-    counts = await grouped(db, Incident.status, assigned, Incident.status.not_in(FINAL))
+    counts = await grouped(db, Incident.status, assigned, Incident.status.not_in(FINAL_STATUSES))
     latest = (
         select(IncidentEvent.incident_id, func.max(IncidentEvent.created_at).label("at"))
         .where(
-            IncidentEvent.type == "status_changed", IncidentEvent.payload["to"].astext == "Resolved"
+            IncidentEvent.type == IncidentEventType.STATUS_CHANGED,
+            IncidentEvent.payload["to"].astext == IncidentStatus.RESOLVED,
         )
         .group_by(IncidentEvent.incident_id)
         .subquery()
@@ -167,11 +185,11 @@ async def engineer_dashboard(
                     & (IncidentEvent.created_at == latest.c.at),
                 )
                 .where(
-                    Incident.status.in_(["Resolved", "Closed"]),
+                    Incident.status.in_(RESOLVED_STATUSES),
                     Incident.resolved_at >= start,
                     Incident.resolved_at < end,
-                    IncidentEvent.type == "status_changed",
-                    IncidentEvent.payload["to"].astext == "Resolved",
+                    IncidentEvent.type == IncidentEventType.STATUS_CHANGED,
+                    IncidentEvent.payload["to"].astext == IncidentStatus.RESOLVED,
                     IncidentEvent.payload["assigned_to"].astext == str(user.id),
                 )
             )
@@ -186,9 +204,9 @@ async def engineer_dashboard(
         "status_counts": counts,
         "queue_href": link(
             assigned_to=user.id,
-            status=["Open", "In Progress", "Blocked", "Resolved"],
-            sort="created",
-            direction="asc",
+            status=NON_FINAL_STATUSES,
+            sort=IncidentSort.CREATED,
+            direction=SortDirection.ASC,
         ),
         "resolved_this_week": {**dict(completed), "from": start, "to": end},
     }
@@ -215,15 +233,13 @@ async def admin_dashboard(
     }
     if building_id:
         cohort.append(Incident.building_id == building_id)
-    nonfinal = [*cohort, Incident.status.not_in(FINAL)]
+    nonfinal = [*cohort, Incident.status.not_in(FINAL_STATUSES)]
     statuses = await grouped(db, Incident.status, *nonfinal)
     priorities = await grouped(db, Incident.priority, *nonfinal)
     for item in statuses:
         item["href"] = link(**filters, status=item["value"])
     for item in priorities:
-        item["href"] = link(
-            **filters, priority=item["value"], status=["Open", "In Progress", "Blocked", "Resolved"]
-        )
+        item["href"] = link(**filters, priority=item["value"], status=NON_FINAL_STATUSES)
     workload_rows = (
         await db.execute(
             select(Incident.assigned_to, Incident.status, func.count().label("count"))
@@ -345,7 +361,7 @@ async def admin_dashboard(
                     EscalationRequest.requested_at,
                 )
                 .join(EscalationRequest, EscalationRequest.incident_id == Incident.id)
-                .where(*cohort, EscalationRequest.state == "Pending")
+                .where(*cohort, EscalationRequest.state == EscalationState.PENDING)
                 .order_by(EscalationRequest.requested_at)
             )
         )
@@ -362,7 +378,7 @@ async def admin_dashboard(
                     Incident.blocked_since,
                     Incident.assigned_to,
                 )
-                .where(*cohort, Incident.status == "Blocked")
+                .where(*cohort, Incident.status == IncidentStatus.BLOCKED)
                 .order_by(Incident.blocked_since)
             )
         )
@@ -379,7 +395,9 @@ async def admin_dashboard(
                 "status": row.status,
                 "count": row.count,
                 "href": link(
-                    **filters, assigned_to=row.assigned_to or "unassigned", status=row.status
+                    **filters,
+                    assigned_to=row.assigned_to or AssigneeFilter.UNASSIGNED,
+                    status=row.status,
                 ),
             }
             for row in workload_rows

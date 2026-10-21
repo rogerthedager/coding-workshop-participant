@@ -10,6 +10,16 @@ from sqlalchemy import func, select, text
 
 from facility.config import settings
 from facility.database import SessionLocal
+from facility.enums import (
+    BlockedReason,
+    EngineerAvailability,
+    EscalationState,
+    IncidentEventType,
+    IncidentPriority,
+    IncidentStatus,
+    NoteVisibility,
+    UserRole,
+)
 from facility.models import (
     Building,
     Category,
@@ -84,7 +94,7 @@ async def seed(include_demo: bool = False) -> dict:
         admins = await db.scalar(
             select(func.count())
             .select_from(User)
-            .where(User.roles.contains(["admin"]), User.is_active.is_(True))
+            .where(User.roles.contains([UserRole.ADMIN]), User.is_active.is_(True))
         )
         email = os.environ.get("SEED_ADMIN_EMAIL", "").strip().lower()
         password = os.environ.get("SEED_ADMIN_PASSWORD", "")
@@ -106,7 +116,7 @@ async def seed(include_demo: bool = False) -> dict:
                 User(
                     email=email,
                     full_name="Facility Administrator",
-                    roles=["admin"],
+                    roles=[UserRole.ADMIN],
                     password_hash=hash_password(password),
                 )
             )
@@ -125,9 +135,9 @@ async def seed_demo(db) -> int:
     """Build recognizable demo personas and a representative workflow history once."""
     added = 0
     accounts = [
-        ("admin@acme.inc", "Alex Morgan", ["admin", "engineer"]),
+        ("admin@acme.inc", "Alex Morgan", [UserRole.ADMIN, UserRole.ENGINEER]),
         ("employee@acme.inc", "Jamie Chen", []),
-        ("engineer@acme.inc", "Sam Rivera", ["engineer"]),
+        ("engineer@acme.inc", "Sam Rivera", [UserRole.ENGINEER]),
         ("employee2@acme.inc", "Taylor Park", []),
     ]
     users = {}
@@ -145,10 +155,10 @@ async def seed_demo(db) -> int:
             await db.flush()
             added += 1
         users[email] = user
-        if "engineer" in user.roles and not await db.scalar(
+        if UserRole.ENGINEER in user.roles and not await db.scalar(
             select(EngineerProfile.id).where(EngineerProfile.user_id == user.id)
         ):
-            db.add(EngineerProfile(user_id=user.id, availability="Available"))
+            db.add(EngineerProfile(user_id=user.id, availability=EngineerAvailability.AVAILABLE))
             added += 1
     for code, name in [("HQ1", "ACME Headquarters"), ("WEST", "West Campus")]:
         building = await db.scalar(select(Building).where(Building.code == code))
@@ -198,7 +208,15 @@ async def seed_demo(db) -> int:
     creator = users["employee@acme.inc"]
     assignee = users["engineer@acme.inc"]
     now = utcnow()
-    statuses = ["Open", "Open", "In Progress", "Blocked", "Resolved", "Closed", "Cancelled"]
+    statuses = [
+        IncidentStatus.OPEN,
+        IncidentStatus.OPEN,
+        IncidentStatus.IN_PROGRESS,
+        IncidentStatus.BLOCKED,
+        IncidentStatus.RESOLVED,
+        IncidentStatus.CLOSED,
+        IncidentStatus.CANCELLED,
+    ]
     for index, status in enumerate(statuses):
         ticket_id = fixed_id(f"incident/{index}")
         if await db.get(Incident, ticket_id):
@@ -215,26 +233,31 @@ async def seed_demo(db) -> int:
             floor_id=floor.id,
             seat_id=fixed_id("seat/HQ1/1-A-01"),
             created_by=creator.id,
-            priority=["Critical", "High", "Medium", "Low"][index % 4],
-            requested_priority="Medium",
+            priority=[
+                IncidentPriority.CRITICAL,
+                IncidentPriority.HIGH,
+                IncidentPriority.MEDIUM,
+                IncidentPriority.LOW,
+            ][index % 4],
+            requested_priority=IncidentPriority.MEDIUM,
             status=status,
             created_at=created,
             updated_at=now,
             reopen_count=0,
         )
-        if status not in ["Open", "Cancelled"]:
+        if status not in [IncidentStatus.OPEN, IncidentStatus.CANCELLED]:
             ticket.assigned_to = assignee.id
             ticket.assigned_at = created + timedelta(hours=1)
             ticket.acknowledged_at = created + timedelta(hours=2)
             ticket.first_in_progress_at = ticket.acknowledged_at
-        if status == "Blocked":
-            ticket.blocked_reason = "Waiting on parts"
+        if status == IncidentStatus.BLOCKED:
+            ticket.blocked_reason = BlockedReason.WAITING_ON_PARTS
             ticket.blocked_since = created + timedelta(hours=3)
-        if status in ["Resolved", "Closed"]:
+        if status in [IncidentStatus.RESOLVED, IncidentStatus.CLOSED]:
             ticket.resolved_at = created + timedelta(hours=5)
-        if status == "Closed":
+        if status == IncidentStatus.CLOSED:
             ticket.closed_at = created + timedelta(hours=6)
-        if status == "Cancelled":
+        if status == IncidentStatus.CANCELLED:
             ticket.cancelled_at = created + timedelta(hours=1)
         db.add(ticket)
         await db.flush()
@@ -242,8 +265,8 @@ async def seed_demo(db) -> int:
             IncidentEvent(
                 incident_id=ticket.id,
                 actor_id=creator.id,
-                type="created",
-                payload={"status": "Open"},
+                type=IncidentEventType.CREATED,
+                payload={"status": IncidentStatus.OPEN},
                 created_at=created,
             )
         )
@@ -252,7 +275,7 @@ async def seed_demo(db) -> int:
                 IncidentEvent(
                     incident_id=ticket.id,
                     actor_id=users["admin@acme.inc"].id,
-                    type="assigned",
+                    type=IncidentEventType.ASSIGNED,
                     payload={"to": str(assignee.id)},
                     created_at=ticket.assigned_at,
                 )
@@ -261,44 +284,53 @@ async def seed_demo(db) -> int:
                 IncidentEvent(
                     incident_id=ticket.id,
                     actor_id=assignee.id,
-                    type="status_changed",
-                    payload={"from": "Open", "to": "In Progress"},
+                    type=IncidentEventType.STATUS_CHANGED,
+                    payload={"from": IncidentStatus.OPEN, "to": IncidentStatus.IN_PROGRESS},
                     created_at=ticket.first_in_progress_at,
                 )
             )
-        if status in ["Blocked", "Resolved", "Closed"]:
-            intermediate = "Resolved" if status in ["Resolved", "Closed"] else "Blocked"
+        if status in [IncidentStatus.BLOCKED, IncidentStatus.RESOLVED, IncidentStatus.CLOSED]:
+            intermediate = (
+                IncidentStatus.RESOLVED
+                if status in [IncidentStatus.RESOLVED, IncidentStatus.CLOSED]
+                else IncidentStatus.BLOCKED
+            )
             db.add(
                 IncidentEvent(
                     incident_id=ticket.id,
                     actor_id=assignee.id,
-                    type="status_changed",
+                    type=IncidentEventType.STATUS_CHANGED,
                     payload={
-                        "from": "In Progress",
+                        "from": IncidentStatus.IN_PROGRESS,
                         "to": intermediate,
                         "assigned_to": str(assignee.id),
                     },
                     created_at=ticket.resolved_at or ticket.blocked_since,
                 )
             )
-        if status in ["Closed", "Cancelled"]:
+        if status in [IncidentStatus.CLOSED, IncidentStatus.CANCELLED]:
             db.add(
                 IncidentEvent(
                     incident_id=ticket.id,
                     actor_id=creator.id,
-                    type="status_changed",
-                    payload={"from": "Resolved" if status == "Closed" else "Open", "to": status},
+                    type=IncidentEventType.STATUS_CHANGED,
+                    payload={
+                        "from": IncidentStatus.RESOLVED
+                        if status == IncidentStatus.CLOSED
+                        else IncidentStatus.OPEN,
+                        "to": status,
+                    },
                     created_at=ticket.closed_at or ticket.cancelled_at,
                 )
             )
-        if status != "Cancelled":
+        if status != IncidentStatus.CANCELLED:
             public = IncidentNote(
                 incident_id=ticket.id,
                 author_id=assignee.id if ticket.assigned_to else creator.id,
                 body="Display replaced and verified."
                 if ticket.resolved_at
                 else "The issue has been recorded; updates will appear here.",
-                visibility="public",
+                visibility=NoteVisibility.PUBLIC,
                 created_at=ticket.resolved_at or created + timedelta(minutes=15),
             )
             db.add(public)
@@ -307,8 +339,8 @@ async def seed_demo(db) -> int:
                 IncidentEvent(
                     incident_id=ticket.id,
                     actor_id=public.author_id,
-                    type="note_added",
-                    payload={"note_id": str(public.id), "visibility": "public"},
+                    type=IncidentEventType.NOTE_ADDED,
+                    payload={"note_id": str(public.id), "visibility": NoteVisibility.PUBLIC},
                     created_at=public.created_at,
                 )
             )
@@ -316,7 +348,7 @@ async def seed_demo(db) -> int:
                 incident_id=ticket.id,
                 author_id=users["admin@acme.inc"].id,
                 body="Internal synthetic diagnostic note.",
-                visibility="internal",
+                visibility=NoteVisibility.INTERNAL,
             )
             db.add(internal)
         if index == 0:
@@ -325,7 +357,7 @@ async def seed_demo(db) -> int:
                     incident_id=ticket.id,
                     requester_id=creator.id,
                     reason="Work cannot continue until the display is fixed.",
-                    state="Pending",
+                    state=EscalationState.PENDING,
                     requested_at=now - timedelta(hours=1),
                 )
             )

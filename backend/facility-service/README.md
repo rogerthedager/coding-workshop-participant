@@ -40,6 +40,10 @@ TEST_DATABASE_URL=<明确指定用于验证的PostgreSQL URL>
 
 ## 接口与业务边界
 
+固定业务取值统一定义在 `facility/enums.py`：工单状态、优先级、附加角色、工程师可用性、备注可见性、升级状态、阻塞原因和审计事件类型，以及列表筛选/排序与 API 错误码。模型、接口校验、权限、流程、报表和 seed 都复用这些枚举。
+
+SQLAlchemy 读写使用枚举的 `.value`，例如 `In Progress`，不会保存成员名 `IN_PROGRESS`。PostgreSQL 保持原有 VARCHAR、TEXT 和 JSONB 列类型；角色仍保存为字符串数组，Employee 仍是隐含权限。迁移 `0002` 只补充合法值约束，不改写已有记录，也不创建 PostgreSQL 原生 ENUM 类型。升级发现不合法的旧数据时会中止，须核实后处理，不能自动猜测替换。
+
 - 认证：`/auth/register`、`/auth/login`、`/auth/refresh`、`/auth/logout`、`/auth/change-password`、`/auth/me`。
 - 人员：`/users`、`/users/me`、`/users/{id}`、`/engineers`、`/engineers/{id}`、`/engineers/me/availability`。
 - 设施：`/buildings`、`/buildings/{id}/floors`、`/floors/{id}/seats`、`/locations/tree`、`/categories`。停用替代物理删除，历史记录保留。

@@ -1,7 +1,7 @@
 """Administrator people maintenance and engineer availability/workloads."""
 
 import secrets
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from facility.database import get_db
 from facility.dependencies import current_user, require_admin
+from facility.enums import NON_FINAL_STATUSES, EngineerAvailability, IncidentStatus, UserRole
 from facility.models import EngineerProfile, Incident, User
 from facility.routers.auth import StrictModel, revoke_sessions, user_output
 from facility.security import hash_password, normalize_email, validate_password
@@ -20,9 +21,6 @@ router = APIRouter(tags=["Users and engineers"])
 Db = Annotated[AsyncSession, Depends(get_db)]
 Actor = Annotated[User, Depends(current_user)]
 Admin = Annotated[User, Depends(require_admin)]
-Availability = Literal["Available", "Busy", "Off-duty"]
-Role = Literal["engineer", "admin"]
-NONFINAL = ("Open", "In Progress", "Blocked", "Resolved")
 
 
 class SelfUpdate(StrictModel):
@@ -43,7 +41,7 @@ class UserUpdate(StrictModel):
     """Administrators may update additive roles, active state and display name."""
 
     full_name: str | None = Field(default=None, min_length=1, max_length=120)
-    roles: list[Role] | None = None
+    roles: list[UserRole] | None = None
     is_active: bool | None = None
 
     @field_validator("full_name")
@@ -74,7 +72,7 @@ class EngineerUpdate(StrictModel):
     full_name: str | None = Field(default=None, min_length=1, max_length=120)
     phone: str | None = Field(default=None, max_length=40)
     is_active: bool | None = None
-    availability: Availability | None = None
+    availability: EngineerAvailability | None = None
 
     @field_validator("full_name")
     @classmethod
@@ -86,7 +84,7 @@ class EngineerUpdate(StrictModel):
 class AvailabilityUpdate(StrictModel):
     """A currently active engineer may set their own availability."""
 
-    availability: Availability
+    availability: EngineerAvailability
 
 
 async def people_guard(db: AsyncSession) -> None:
@@ -107,16 +105,16 @@ async def locked_user(db: AsyncSession, user_id: UUID) -> User:
     return user
 
 
-async def workload(db: AsyncSession, user_id: UUID) -> dict[str, int]:
+async def workload(db: AsyncSession, user_id: UUID) -> dict[IncidentStatus, int]:
     """Count non-final assignments without granting access to incident contents."""
     rows = (
         await db.execute(
             select(Incident.status, func.count())
-            .where(Incident.assigned_to == user_id, Incident.status.in_(NONFINAL))
+            .where(Incident.assigned_to == user_id, Incident.status.in_(NON_FINAL_STATUSES))
             .group_by(Incident.status)
         )
     ).all()
-    counts = dict.fromkeys(NONFINAL, 0)
+    counts = dict.fromkeys(NON_FINAL_STATUSES, 0)
     counts.update({status: count for status, count in rows})
     return counts
 
@@ -148,7 +146,7 @@ async def engineer_output(db: AsyncSession, profile: EngineerProfile, user: User
 
 async def require_staff(user: User) -> None:
     """Keep directory/contact information limited to staff."""
-    if not set(user.roles).intersection({"admin", "engineer"}):
+    if not set(user.roles).intersection({UserRole.ADMIN, UserRole.ENGINEER}):
         raise HTTPException(403, "Staff access required")
 
 
@@ -203,23 +201,27 @@ async def update_user(user_id: UUID, payload: UserUpdate, db: Db, _: Admin) -> d
         raise HTTPException(422, "Provide non-null fields to update")
     roles = sorted(set(payload.roles)) if payload.roles is not None else user.roles
     active = payload.is_active if payload.is_active is not None else user.is_active
-    if user.is_active and "admin" in user.roles and (not active or "admin" not in roles):
+    if (
+        user.is_active
+        and UserRole.ADMIN in user.roles
+        and (not active or UserRole.ADMIN not in roles)
+    ):
         remaining = await db.scalar(
             select(func.count(User.id)).where(
                 User.id != user.id,
                 User.is_active.is_(True),
-                User.roles.contains(["admin"]),
+                User.roles.contains([UserRole.ADMIN]),
             )
         )
         if not remaining:
             raise HTTPException(409, "The last active administrator cannot be removed")
-    removing_engineer = "engineer" in user.roles and "engineer" not in roles
+    removing_engineer = UserRole.ENGINEER in user.roles and UserRole.ENGINEER not in roles
     if not active or removing_engineer:
         await ensure_unassigned(db, user.id)
     profile = await db.scalar(select(EngineerProfile).where(EngineerProfile.user_id == user.id))
     if (
-        "engineer" in roles
-        and "engineer" not in user.roles
+        UserRole.ENGINEER in roles
+        and UserRole.ENGINEER not in user.roles
         and (profile is None or not profile.is_active)
     ):
         raise HTTPException(409, "Create or reactivate an engineer profile first")
@@ -286,7 +288,7 @@ async def create_engineer(payload: EngineerCreate, db: Db, _: Admin) -> dict:
             email=payload.email,
             full_name=payload.full_name,
             password_hash=hash_password(temporary),
-            roles=["engineer"],
+            roles=[UserRole.ENGINEER],
             must_change_password=True,
         )
         db.add(user)
@@ -304,7 +306,7 @@ async def create_engineer(payload: EngineerCreate, db: Db, _: Admin) -> dict:
     profile = await db.scalar(select(EngineerProfile).where(EngineerProfile.user_id == user.id))
     if profile is not None:
         raise HTTPException(409, "Engineer profile already exists; edit or reactivate it")
-    user.roles = sorted(set(user.roles) | {"engineer"})
+    user.roles = sorted(set(user.roles) | {UserRole.ENGINEER})
     profile = EngineerProfile(user_id=user.id, phone=payload.phone)
     db.add(profile)
     await db.commit()
@@ -319,7 +321,7 @@ async def set_own_availability(payload: AvailabilityUpdate, db: Db, actor: Actor
     """Set availability only for an active engineer identity and profile."""
     actor = await locked_user(db, actor.id)
     profile = await db.scalar(select(EngineerProfile).where(EngineerProfile.user_id == actor.id))
-    if "engineer" not in actor.roles or profile is None or not profile.is_active:
+    if UserRole.ENGINEER not in actor.roles or profile is None or not profile.is_active:
         raise HTTPException(403, "An active engineer profile is required")
     profile.availability = payload.availability
     await db.commit()
@@ -354,7 +356,7 @@ async def update_engineer(engineer_id: UUID, payload: EngineerUpdate, db: Db, _:
     if payload.is_active is True:
         if not user.is_active:
             raise HTTPException(409, "Reactivate the user account first")
-        user.roles = sorted(set(user.roles) | {"engineer"})
+        user.roles = sorted(set(user.roles) | {UserRole.ENGINEER})
     if payload.full_name is not None:
         user.full_name = payload.full_name
     for key in ("phone", "is_active", "availability"):

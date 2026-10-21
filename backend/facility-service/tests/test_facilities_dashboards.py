@@ -134,7 +134,8 @@ async def test_dashboards_count_only_their_persona_scope(
 ):
     """Count seeded facts and preserve creator/assignment boundaries in dashboards."""
     await make_incident(status="Open", priority="High")
-    await make_incident(status="Blocked", blocked_reason="Vendor part unavailable", priority="High")
+    # The fixed reason code is separate from a vendor's free-text explanation in notes.
+    await make_incident(status="Blocked", blocked_reason="Vendor needed", priority="High")
     await make_incident(status="Resolved", assigned_to=None)
     await make_incident(created_by=other_employee.id, assigned_to=None)
     creator = await client.get("/api/v1/dashboard/employee", headers=await auth_headers(employee))
