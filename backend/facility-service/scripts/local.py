@@ -33,7 +33,9 @@ def pg_bin() -> Path:
     elif shutil.which("initdb"):
         result = Path(shutil.which("initdb") or "").parent
     else:
-        result = Path(r"C:\Program Files\PostgreSQL\16\bin")
+        # Newest installed version first; 16 is the target, newer majors also work.
+        candidates = [Path(rf"C:\Program Files\PostgreSQL\{major}\bin") for major in (18, 17, 16)]
+        result = next((p for p in candidates if (p / "initdb.exe").exists()), candidates[-1])
     if not (result / ("initdb.exe" if os.name == "nt" else "initdb")).exists():
         raise RuntimeError("Install PostgreSQL 16, or set FACILITY_PG_BIN to its bin directory.")
     return result
@@ -184,7 +186,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=["init", "migrate", "seed", "serve", "test", "status", "stop"],
+        choices=["init", "migrate", "seed", "serve", "jobs", "test", "status", "stop"],
     )
     arguments, remainder = parser.parse_known_args()
     if arguments.command == "init":
@@ -201,6 +203,11 @@ def main() -> None:
         commands = {
             "migrate": [sys.executable, "-m", "alembic", "upgrade", "head"],
             "seed": [sys.executable, "-m", "facility.seed"],
+            "jobs": [
+                sys.executable,
+                "-c",
+                "import json, jobs_handler; print(json.dumps(jobs_handler.handler({}, None)))",
+            ],
             "serve": [
                 sys.executable,
                 "-m",

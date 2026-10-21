@@ -12,8 +12,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from facility.database import get_db
 from facility.dependencies import current_user, require_admin
-from facility.enums import NON_FINAL_STATUSES, EngineerAvailability, IncidentStatus, UserRole
-from facility.models import EngineerProfile, Incident, User
+from facility.enums import (
+    MAX_ENGINEER_SKILLS,
+    NON_FINAL_STATUSES,
+    REQUIRED_ENGINEER_SKILLS,
+    EngineerAvailability,
+    EngineerSkill,
+    IncidentStatus,
+    UserRole,
+)
+from facility.errors import fail
+from facility.models import (
+    Building,
+    EngineerProfile,
+    Floor,
+    Incident,
+    Seat,
+    Team,
+    User,
+    validate_skill_list,
+)
 from facility.routers.auth import StrictModel, revoke_sessions, user_output
 from facility.security import hash_password, normalize_email, validate_password
 
@@ -37,6 +55,19 @@ class SelfUpdate(StrictModel):
         return value.strip()
 
 
+class MeUpdate(StrictModel):
+    """Self-service fields: display name and default report seat."""
+
+    full_name: str | None = Field(default=None, min_length=1, max_length=120)
+    default_seat_id: UUID | None = None
+
+    @field_validator("full_name")
+    @classmethod
+    def valid_name(cls, value: str | None) -> str | None:
+        """Normalize names when supplied."""
+        return SelfUpdate.valid_name(value) if value is not None else None
+
+
 class UserUpdate(StrictModel):
     """Administrators may update additive roles, active state and display name."""
 
@@ -51,13 +82,27 @@ class UserUpdate(StrictModel):
         return SelfUpdate.valid_name(value) if value is not None else None
 
 
+def unique_skills(value: list[EngineerSkill] | None) -> list[EngineerSkill] | None:
+    """Require exactly two different skills (FR-4.5)."""
+    if value is None:
+        return None
+    skills = validate_skill_list(value)
+    if len(skills) != REQUIRED_ENGINEER_SKILLS:
+        raise ValueError(f"An engineer needs exactly {REQUIRED_ENGINEER_SKILLS} different skills")
+    return skills
+
+
 class EngineerCreate(SelfUpdate):
     """Add Engineer to an existing identity, or create a temporary-password identity."""
 
     email: str
     phone: str | None = Field(default=None, max_length=40)
+    skills: list[EngineerSkill] = Field(max_length=MAX_ENGINEER_SKILLS)
+    team_id: UUID | None = None
+    home_building_ids: list[UUID] = Field(default_factory=list, max_length=20)
     temporary_password: str | None = None
     _email = field_validator("email")(normalize_email)
+    _skills = field_validator("skills")(unique_skills)
 
     @field_validator("temporary_password")
     @classmethod
@@ -73,6 +118,9 @@ class EngineerUpdate(StrictModel):
     phone: str | None = Field(default=None, max_length=40)
     is_active: bool | None = None
     availability: EngineerAvailability | None = None
+    skills: list[EngineerSkill] | None = Field(default=None, max_length=MAX_ENGINEER_SKILLS)
+    home_building_ids: list[UUID] | None = Field(default=None, max_length=20)
+    _skills = field_validator("skills")(unique_skills)
 
     @field_validator("full_name")
     @classmethod
@@ -125,7 +173,11 @@ async def ensure_unassigned(db: AsyncSession, user_id: UUID) -> None:
     if count:
         raise HTTPException(
             409,
-            {"message": "Reassign non-final incidents first", "affected_count": count},
+            {
+                "code": "has_assigned_incidents",
+                "message": "Reassign non-final incidents first",
+                "affected_count": count,
+            },
         )
 
 
@@ -138,6 +190,9 @@ async def engineer_output(db: AsyncSession, profile: EngineerProfile, user: User
         "phone": profile.phone,
         "is_active": profile.is_active,
         "availability": profile.availability,
+        "skills": profile.skills,
+        "team_id": str(profile.team_id) if profile.team_id else None,
+        "home_building_ids": [str(item) for item in profile.home_building_ids or []],
         "workload": sum(counts.values()),
         "status_counts": counts,
         "user": user_output(user),
@@ -182,11 +237,42 @@ async def list_users(
     }
 
 
+async def check_buildings(db: AsyncSession, building_ids: list[UUID]) -> list[UUID]:
+    """Home buildings must exist; duplicates are dropped."""
+    unique = list(dict.fromkeys(building_ids))
+    if unique:
+        found = set(await db.scalars(select(Building.id).where(Building.id.in_(unique))))
+        if found != set(unique):
+            raise HTTPException(422, "Every home building must exist")
+    return unique
+
+
+async def check_default_seat(db: AsyncSession, seat_id: UUID) -> None:
+    """A default seat must be active with active ancestors."""
+    row = await db.execute(
+        select(Seat.is_active, Floor.is_active, Building.is_active)
+        .join(Floor, Floor.id == Seat.floor_id)
+        .join(Building, Building.id == Floor.building_id)
+        .where(Seat.id == seat_id)
+    )
+    flags = row.first()
+    if flags is None or not all(flags):
+        raise fail(422, "location_inactive", "Choose an active seat")
+
+
 @router.patch("/users/me")
-async def update_self(payload: SelfUpdate, db: Db, actor: Actor) -> dict:
-    """Update only the caller's nonprivileged display name."""
+async def update_self(payload: MeUpdate, db: Db, actor: Actor) -> dict:
+    """Update the caller's display name and default seat."""
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes or changes.get("full_name", "x") is None:
+        raise HTTPException(422, "Provide full_name or default_seat_id")
     actor = await locked_user(db, actor.id)
-    actor.full_name = payload.full_name
+    if "default_seat_id" in changes:
+        if payload.default_seat_id is not None:
+            await check_default_seat(db, payload.default_seat_id)
+        actor.default_seat_id = payload.default_seat_id
+    if payload.full_name is not None:
+        actor.full_name = payload.full_name
     await db.commit()
     return user_output(actor)
 
@@ -214,8 +300,12 @@ async def update_user(user_id: UUID, payload: UserUpdate, db: Db, _: Admin) -> d
             )
         )
         if not remaining:
-            raise HTTPException(409, "The last active administrator cannot be removed")
+            raise fail(409, "last_admin", "The last active administrator cannot be removed")
     removing_engineer = UserRole.ENGINEER in user.roles and UserRole.ENGINEER not in roles
+    if (not active or UserRole.LEAD not in roles) and await db.scalar(
+        select(Team.id).where(Team.lead_user_id == user.id, Team.is_active.is_(True))
+    ):
+        raise fail(409, "team_needs_lead", "Give the team a new lead first")
     if not active or removing_engineer:
         await ensure_unassigned(db, user.id)
     profile = await db.scalar(select(EngineerProfile).where(EngineerProfile.user_id == user.id))
@@ -224,9 +314,12 @@ async def update_user(user_id: UUID, payload: UserUpdate, db: Db, _: Admin) -> d
         and UserRole.ENGINEER not in user.roles
         and (profile is None or not profile.is_active)
     ):
-        raise HTTPException(409, "Create or reactivate an engineer profile first")
+        raise fail(
+            409, "engineer_profile_required", "Create or reactivate an engineer profile first"
+        )
     if removing_engineer and profile is not None:
         profile.is_active = False
+        profile.team_id = None
     if user.is_active and not active:
         user.token_version += 1
         await revoke_sessions(db, user.id)
@@ -307,7 +400,17 @@ async def create_engineer(payload: EngineerCreate, db: Db, _: Admin) -> dict:
     if profile is not None:
         raise HTTPException(409, "Engineer profile already exists; edit or reactivate it")
     user.roles = sorted(set(user.roles) | {UserRole.ENGINEER})
-    profile = EngineerProfile(user_id=user.id, phone=payload.phone)
+    if payload.team_id is not None:
+        team = await db.get(Team, payload.team_id)
+        if team is None or not team.is_active:
+            raise HTTPException(422, "Team must be an active team")
+    profile = EngineerProfile(
+        user_id=user.id,
+        phone=payload.phone,
+        skills=payload.skills,
+        team_id=payload.team_id,
+        home_building_ids=await check_buildings(db, payload.home_building_ids),
+    )
     db.add(profile)
     await db.commit()
     output = await engineer_output(db, profile, user)
@@ -359,7 +462,11 @@ async def update_engineer(engineer_id: UUID, payload: EngineerUpdate, db: Db, _:
         user.roles = sorted(set(user.roles) | {UserRole.ENGINEER})
     if payload.full_name is not None:
         user.full_name = payload.full_name
-    for key in ("phone", "is_active", "availability"):
+    if payload.is_active is False:
+        profile.team_id = None
+    if payload.home_building_ids is not None:
+        profile.home_building_ids = await check_buildings(db, payload.home_building_ids)
+    for key in ("phone", "is_active", "availability", "skills"):
         if key in changes:
             setattr(profile, key, changes[key])
     await db.commit()

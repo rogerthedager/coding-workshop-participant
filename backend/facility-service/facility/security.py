@@ -1,9 +1,11 @@
 """Password hashing and purpose-bound signed/opaque tokens."""
 
+import functools
 import hashlib
 import re
 import secrets
 from datetime import timedelta
+from uuid import UUID
 
 import bcrypt
 import jwt
@@ -28,9 +30,16 @@ def validate_password(password: str) -> str:
 
 
 def normalize_email(email: str) -> str:
-    """Normalize and validate the organization-only registration domain."""
+    """Accept corporate ASCII dot-atom addresses on the exact ACME domain."""
     value = email.strip().lower()
-    if len(value) > 254 or not re.fullmatch(r"[^@\s]+@acme\.inc", value):
+    local, separator, domain = value.rpartition("@")
+    atom = r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+"
+    if (
+        separator != "@"
+        or domain != "acme.inc"
+        or not 1 <= len(local) <= 64
+        or not re.fullmatch(rf"{atom}(?:\.{atom})*", local)
+    ):
         raise ValueError("An @acme.inc email address is required")
     return value
 
@@ -39,6 +48,12 @@ def hash_password(password: str) -> str:
     """Hash a validated password with bcrypt cost 12."""
     validate_password(password)
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("ascii")
+
+
+@functools.cache
+def dummy_password_hash() -> str:
+    """A cost-12 hash to check against when the account is unknown or locked."""
+    return bcrypt.hashpw(secrets.token_bytes(16), bcrypt.gensalt(rounds=12)).decode("ascii")
 
 
 def verify_password(password: str, encoded: str) -> bool:
@@ -62,13 +77,14 @@ def signing_secret() -> str:
     return secret
 
 
-def create_access_token(user: User) -> str:
-    """Bind access tokens to the user's current database token version."""
+def create_access_token(user: User, family_id: UUID) -> str:
+    """Bind access to the user version and a revocable login-session family."""
     now = utcnow()
     return jwt.encode(
         {
             "sub": str(user.id),
             "ver": user.token_version,
+            "sid": str(family_id),
             "iat": now,
             "exp": now + timedelta(minutes=settings.access_minutes),
             "iss": "acme-facility",
@@ -89,10 +105,14 @@ def decode_access_token(token: str) -> dict:
             algorithms=["HS256"],
             audience="facility-service",
             issuer="acme-facility",
-            options={"require": ["sub", "ver", "iat", "exp", "iss", "aud", "jti"]},
+            options={"require": ["sub", "ver", "sid", "iat", "exp", "iss", "aud", "jti"]},
         )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            401, {"code": "token_expired", "message": "Access token has expired"}
+        ) from None
     except jwt.InvalidTokenError:
-        raise HTTPException(401, "Invalid or expired access token") from None
+        raise HTTPException(401, "Invalid access token") from None
 
 
 def hash_refresh_token(raw: str) -> str:

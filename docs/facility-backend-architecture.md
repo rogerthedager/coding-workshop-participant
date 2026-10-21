@@ -7,20 +7,41 @@
 ```text
 backend/facility-service/
   function.py                 Workshop function.handler，HTTP 适配
+  jobs_handler.py             定时任务 Lambda 入口（EventBridge 每 15 分钟）
   migration_handler.py        独立迁移 Lambda 的控制面入口
   facility/
     config.py                 本地/Workshop 环境与 Secrets Manager 配置
     database.py               PostgreSQL 会话，NullPool
-    models.py                 11 个核心实体
+    enums.py                  全部固定取值（状态、优先级、角色、错误码等）
+    db_types.py               枚举与 JSON 列的 SQLAlchemy 类型
+    errors.py                 带错误码的 HTTP 异常
+    models/                   数据表，每个模型一个文件
+      __init__.py             统一导出：from facility.models import Incident
+      base.py                 公共 id/时间戳列与 utcnow()
+      user.py  refresh_session.py  team.py  engineer_profile.py
+      building.py  floor.py  seat.py  category_group.py  category.py
+      incident.py  incident_follower.py  incident_note.py  incident_event.py
+      escalation_request.py  attachment.py  notification.py
     security.py               bcrypt、JWT、刷新令牌摘要
     dependencies.py           当前数据库身份和角色检查
     permissions.py            工单归属、操作权限、版本、审计
+    workflow.py               状态流转公共规则
+    routing.py                新工单按分组自动分派、工程师排名
+    sla.py                    SLA 到期时间与状态
+    notifications.py          事件生成站内通知（同一事务）
+    jobs.py                   自动关闭、SLA 预警、过期上传清理
+    metrics.py                全公司与团队报表指标
+    storage.py                S3 附件预签名与文件头校验
     routers/
       auth.py                 登录、注册、会话、改密
       people.py               用户、工程师、可用性和工作量
+      teams.py                团队、成员、类别分组
       facilities.py           建筑/楼层/座位、分类
-      incidents.py            工单、状态、分派、备注、升级
-      dashboards.py           三个角色的实时 SQL 报表
+      incidents.py            工单、状态、分派、备注、升级、CSV 导出
+      coordination.py         相似工单、关注、重复、退回分派、工程师推荐
+      attachments.py          附件上传与下载
+      notifications.py        通知列表与已读
+      dashboards.py           员工/工程师/管理员/团队负责人报表
     seed.py                   幂等参考数据、管理员与可选演示数据
     sessions.py               会话保留期清理工具
   migrations/                 冻结的 Alembic 迁移

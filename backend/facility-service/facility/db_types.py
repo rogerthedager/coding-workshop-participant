@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Dialect
 from sqlalchemy.types import TypeDecorator
 
-from facility.enums import UserRole
+from facility.enums import EngineerSkill, UserRole
 
 DomainEnum = TypeVar("DomainEnum", bound=StrEnum)
 
@@ -66,3 +66,20 @@ class UserRolesJSON(TypeDecorator):
     def process_result_value(self, value: list[str], dialect: Dialect) -> list[UserRole]:
         """Rehydrate JSON values into the shared role type."""
         return [UserRole(role) for role in value]
+
+
+class EngineerSkillsJSON(TypeDecorator):
+    """Store engineer skills as a JSONB array while exposing typed skill members."""
+
+    impl = JSONB
+    cache_ok = True
+
+    def process_bind_param(self, value: object, dialect: Dialect) -> list[str]:
+        """Only a list of supported skills may be stored."""
+        if not isinstance(value, list):
+            raise ValueError("Skills must be a list")
+        return [EngineerSkill(skill).value for skill in value]
+
+    def process_result_value(self, value: list[str], dialect: Dialect) -> list[EngineerSkill]:
+        """Rehydrate JSON values into the shared skill type."""
+        return [EngineerSkill(skill) for skill in value]

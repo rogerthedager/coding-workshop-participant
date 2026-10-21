@@ -19,7 +19,7 @@ py -m venv .venv
 
 如果 PostgreSQL 安装位置不同，先设置 `FACILITY_PG_BIN` 指向其 `bin` 目录。Windows 原生服务使用当前用户启动；Linux/macOS 在普通用户下运行。首次 `init` 只初始化空的服务目录；后续运行复用集群，不重置密码、不删除数据。端口被其他程序占用时应先处理端口冲突。
 
-浏览器打开 [交互式 API 文档](http://localhost:8019/docs)。演示账号为 `admin@acme.inc`、`employee@acme.inc`、`engineer@acme.inc`、`employee2@acme.inc`，初始演示密码为 `DemoPass123!`。可在首次演示初始化前通过 `DEMO_PASSWORD` 设置自己的密码。演示数据仅允许写入本地 `acme_facility_dev`；重复执行不会重设已有账号、权限、密码或工单。
+浏览器打开 [交互式 API 文档](http://localhost:8019/docs)。演示账号为 `admin@acme.inc`、`employee@acme.inc`、`engineer@acme.inc`、`employee2@acme.inc`，另有四个团队负责人 `it.lead@acme.inc`、`infra.lead@acme.inc`、`workplace.lead@acme.inc`、`security.lead@acme.inc` 及其团队工程师，初始演示密码为 `DemoPass123!`。可在首次演示初始化前通过 `DEMO_PASSWORD` 设置自己的密码。演示数据仅允许写入本地 `acme_facility_dev`；重复执行不会重设已有账号、权限、密码或工单。
 
 正式初始化不使用 `--demo`：设置 `SEED_ADMIN_EMAIL`（`@acme.inc`）与 `SEED_ADMIN_PASSWORD` 后执行 `seed`。已有管理员时不会自动提升其他账号权限。普通注册始终只有员工权限。
 
@@ -47,13 +47,17 @@ SQLAlchemy 读写使用枚举的 `.value`，例如 `In Progress`，不会保存�
 - 认证：`/auth/register`、`/auth/login`、`/auth/refresh`、`/auth/logout`、`/auth/change-password`、`/auth/me`。
 - 人员：`/users`、`/users/me`、`/users/{id}`、`/engineers`、`/engineers/{id}`、`/engineers/me/availability`。
 - 设施：`/buildings`、`/buildings/{id}/floors`、`/floors/{id}/seats`、`/locations/tree`、`/categories`。停用替代物理删除，历史记录保留。
-- 工单：`/incidents`、`/incidents/{id}`，以及 `/assign`、`/priority`、`/transitions`、`/escalation`、`/escalation/decision`、`/notes`、`/timeline`。
+- 工单：`/incidents`、`/incidents/{id}`，以及 `/assign`、`/priority`、`/transitions`、`/escalation`、`/escalation/decision`、`/notes`、`/timeline`、`/duplicate`、`/return-to-triage`、`/engineer-suggestions`、`/follow`；`/incidents/similar` 返回同楼层同类别的近期工单预览。
+- 团队与分派：`/teams`、`/teams/{id}/members`、`/category-groups`。新工单按顶级类别所属分组自动分派给负责团队中排名最高的在岗工程师；分组无团队、无人在岗或被退回时进入管理员分派队列（`triage_reason`）。
+- 附件：`/incidents/{id}/attachments/presign`、`/incidents/{id}/attachments`、`/attachments/{id}`。浏览器以预签名 POST 直传私有 S3 桶（上限 5 MB），服务端校验文件头。需设置 `FACILITY_ATTACHMENTS_BUCKET`（本地 MinIO 可设 `FACILITY_ATTACHMENTS_ENDPOINT_URL`），未配置时返回 `503`。
+- 通知：`/notifications`、`/notifications/unread-count`、`/notifications/{id}/read`、`/notifications/read-all`。通知与触发它的变更在同一事务中写入，正文只用固定模板，不含备注内容。
 - 备注：`/notes/{id}` 编辑自己的备注（创建后 10 分钟内）；`/notes/{id}/hide` 由管理员隐藏并保留审计。
-- 报表：`/dashboard/employee`、`/dashboard/engineer`、`/dashboard/admin`。
+- 报表：`/dashboard/employee`、`/dashboard/engineer`、`/dashboard/admin`（含全公司指标与分派健康度）、`/dashboard/team`（团队负责人汇总，`period=week|month|quarter`、`tz`）。
+- 定时任务：`jobs_handler.handler` 由 EventBridge 每 15 分钟调用，执行解决 72 小时后自动关闭、SLA 预警（每个阈值每单仅一次）和过期上传清理；本地可运行 `scripts/local.py jobs`。
 
-所有接口字段、权限和示例以交互式文档和自动化验收为准。更新工单、添加备注、审批升级时，将最新响应的 `updated_at` 放入 `If-Match`；缺失返回 `428`，版本过期返回 `409`。编辑或隐藏备注使用备注自身版本。员工只能查看自己的工单，工程师只能查看自己创建或被分派的工单，管理员可查看全部；内部和隐藏备注不会出现在员工投影中。
+所有接口字段、权限和示例以交互式文档和自动化验收为准。更新工单、添加备注、审批升级时，将最新响应的 `updated_at` 放入 `If-Match`；缺失返回 `428`，版本过期返回 `409`。编辑或隐藏备注使用备注自身版本。员工只能查看自己创建或关注的工单（关注者看不到描述和报告人），工程师还可查看被分派的工单，团队负责人可查看本团队成员的工单（含内部备注，但只能执行"退回分派"），管理员可查看全部；内部和隐藏备注不会出现在员工投影中。
 
-此交付提供后端工作流与图形前端所需的状态、权限、统计和下钻链接。附件、关注者、自动通知、外部集成及自动关闭属于后续增强范围。云部署配置见仓库新增的设施服务部署说明。
+此交付提供后端工作流与图形前端所需的状态、权限、统计和下钻链接。外部集成（邮件、短信、聊天工具）不在范围内。云部署配置见仓库新增的设施服务部署说明。
 
 ## 测试和验证
 

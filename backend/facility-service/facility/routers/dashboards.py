@@ -1,30 +1,36 @@
 """Live PostgreSQL aggregates restricted to each dashboard persona."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Float, case, func, select
+from sqlalchemy import Float, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from facility import metrics
 from facility.database import get_db
 from facility.dependencies import current_user, require_admin
 from facility.enums import (
+    AUTO_CLOSE_HOURS,
     FINAL_STATUSES,
     NON_FINAL_STATUSES,
     RESOLVED_STATUSES,
+    TEAM_PERIOD_DAYS,
     AssigneeFilter,
+    EngineerAvailability,
     EscalationState,
     IncidentEventType,
-    IncidentScope,
     IncidentSort,
     IncidentStatus,
     NoteVisibility,
+    SlaState,
     SortDirection,
+    TeamPeriod,
     UserRole,
 )
+from facility.errors import fail
 from facility.models import (
     Building,
     Category,
@@ -33,11 +39,15 @@ from facility.models import (
     Floor,
     Incident,
     IncidentEvent,
+    IncidentFollower,
     IncidentNote,
     Seat,
+    Team,
     User,
     utcnow,
 )
+from facility.permissions import is_admin
+from facility.sla import sla_state_sql
 
 router = APIRouter(prefix="/dashboard", tags=["dashboards"])
 
@@ -96,22 +106,39 @@ async def communication(db: AsyncSession, *conditions: object) -> list[dict]:
 async def employee_dashboard(
     db: AsyncSession = Depends(get_db), user: User = Depends(current_user)
 ) -> dict:
-    """Count the creator's tickets and show actionable public updates."""
-    owned = Incident.created_by == user.id
+    """Count the caller's created and followed tickets; show actionable updates."""
+    created = Incident.created_by == user.id
+    owned = or_(
+        created,
+        Incident.id.in_(
+            select(IncidentFollower.incident_id).where(IncidentFollower.user_id == user.id)
+        ),
+    )
     counts = await grouped(db, Incident.status, owned)
     for count in counts:
-        count["href"] = link(status=count["value"], scope=IncidentScope.MINE)
-    awaiting = (
-        (
+        count["href"] = link(status=count["value"])
+    now = utcnow()
+    awaiting = [
+        {
+            **dict(row),
+            "auto_close_at": close_at,
+            "seconds_until_auto_close": max(0, int((close_at - now).total_seconds()))
+            if close_at
+            else None,
+        }
+        for row in (
             await db.execute(
                 select(Incident.id, Incident.number, Incident.title, Incident.resolved_at)
-                .where(owned, Incident.status == IncidentStatus.RESOLVED)
+                .where(created, Incident.status == IncidentStatus.RESOLVED)
                 .order_by(Incident.resolved_at, Incident.id)
             )
         )
         .mappings()
         .all()
-    )
+        for close_at in [
+            row.resolved_at + timedelta(hours=AUTO_CLOSE_HOURS) if row.resolved_at else None
+        ]
+    ]
     recent = await db.execute(
         select(
             IncidentNote.id, IncidentNote.incident_id, IncidentNote.body, IncidentNote.created_at
@@ -127,7 +154,7 @@ async def employee_dashboard(
     )
     return {
         "status_counts": counts,
-        "awaiting_confirmation": [dict(row) for row in awaiting],
+        "awaiting_confirmation": awaiting,
         "recent_public_notes": [dict(row) for row in recent.mappings()],
         "communication": await communication(db, owned, Incident.status.not_in(FINAL_STATUSES)),
     }
@@ -137,6 +164,7 @@ async def employee_dashboard(
 async def engineer_dashboard(
     week_start: datetime | None = None,
     week_end: datetime | None = None,
+    tz: str | None = Query(default=None, max_length=64),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(current_user),
 ) -> dict:
@@ -150,10 +178,12 @@ async def engineer_dashboard(
     )
     if profile is None:
         raise HTTPException(403, "Active engineer profile required")
-    now = utcnow()
-    start = week_start or (now - timedelta(days=now.weekday())).replace(
+    # "This week" is the viewer's local calendar week, Monday 00:00 (NFR-10).
+    local_now = utcnow().astimezone(metrics.zone(tz))
+    local_monday = (local_now - timedelta(days=local_now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+    start = week_start or local_monday.astimezone(UTC)
     end = week_end or (start + timedelta(days=7))
     if start.tzinfo is None or end.tzinfo is None or end <= start:
         raise HTTPException(422, "Supply timezone-aware week_start and week_end")
@@ -199,13 +229,34 @@ async def engineer_dashboard(
     )
     for count in counts:
         count["href"] = link(assigned_to=user.id, status=count["value"])
+    state = sla_state_sql()
+    sla_rows = dict(
+        (
+            await db.execute(
+                select(state, func.count(Incident.id))
+                .where(assigned, Incident.status.not_in(FINAL_STATUSES))
+                .group_by(state)
+            )
+        ).all()
+    )
+    sla_health = [
+        {
+            "value": value,
+            "count": sla_rows.get(value.value, 0),
+            "href": link(
+                assigned_to=user.id, status=NON_FINAL_STATUSES, sla_state=value.value
+            ),
+        }
+        for value in (SlaState.ON_TRACK, SlaState.AT_RISK, SlaState.BREACHED)
+    ]
     return {
         "availability": profile.availability,
         "status_counts": counts,
+        "sla_health": sla_health,
         "queue_href": link(
             assigned_to=user.id,
             status=NON_FINAL_STATUSES,
-            sort=IncidentSort.CREATED,
+            sort=IncidentSort.SLA_DUE,
             direction=SortDirection.ASC,
         ),
         "resolved_this_week": {**dict(completed), "from": start, "to": end},
@@ -226,20 +277,26 @@ async def admin_dashboard(
     if start.tzinfo is None or end.tzinfo is None or start >= end:
         raise HTTPException(422, "Use timezone-aware from < to")
     cohort = [Incident.created_at >= start, Incident.created_at < end]
+    # created_to is exclusive, matching the cohort's `< end` (date_to is inclusive).
     filters = {
-        "date_from": start.isoformat(),
-        "date_to": end.isoformat(),
+        "created_from": start.isoformat(),
+        "created_to": end.isoformat(),
         "building_id": building_id,
     }
-    if building_id:
-        cohort.append(Incident.building_id == building_id)
-    nonfinal = [*cohort, Incident.status.not_in(FINAL_STATUSES)]
+    location = [Incident.building_id == building_id] if building_id else []
+    cohort.extend(location)
+    # Current-state widgets count every non-final ticket now; the range applies to
+    # flow widgets only (N17).
+    nonfinal = [*location, Incident.status.not_in(FINAL_STATUSES)]
     statuses = await grouped(db, Incident.status, *nonfinal)
     priorities = await grouped(db, Incident.priority, *nonfinal)
+    current_filters = {"building_id": building_id}
     for item in statuses:
-        item["href"] = link(**filters, status=item["value"])
+        item["href"] = link(**current_filters, status=item["value"])
     for item in priorities:
-        item["href"] = link(**filters, priority=item["value"], status=NON_FINAL_STATUSES)
+        item["href"] = link(
+            **current_filters, priority=item["value"], status=NON_FINAL_STATUSES
+        )
     workload_rows = (
         await db.execute(
             select(Incident.assigned_to, Incident.status, func.count().label("count"))
@@ -282,13 +339,22 @@ async def admin_dashboard(
                         func.avg(func.extract("epoch", column - Incident.created_at))
                         .cast(Float)
                         .label("mean_seconds"),
+                        func.percentile_cont(0.5)
+                        .within_group(func.extract("epoch", column - Incident.created_at))
+                        .label("median_seconds"),
                     ).where(*cohort, column.is_not(None))
                 )
             )
             .mappings()
             .one()
         )
-        lifecycle[label] = {**dict(result), "href": link(**filters)}
+        lifecycle[label] = {
+            **dict(result),
+            "median_seconds": float(result["median_seconds"])
+            if result["median_seconds"] is not None
+            else None,
+            "href": link(**filters),
+        }
     hotspots = {}
     for label, model, column in [
         ("buildings", Building, Incident.building_id),
@@ -317,7 +383,9 @@ async def admin_dashboard(
             {**dict(row), "href": link(**{**filters, filter_name: row.id})} for row in rows
         ]
     exact_location = case(
-        (Incident.seat_id.is_not(None), Incident.seat_id), else_=Incident.floor_id
+        (Incident.seat_id.is_not(None), Incident.seat_id),
+        (Incident.floor_id.is_not(None), Incident.floor_id),
+        else_=Incident.building_id,
     )
     recurring_conditions = [
         Incident.created_at >= end - timedelta(days=30),
@@ -361,7 +429,7 @@ async def admin_dashboard(
                     EscalationRequest.requested_at,
                 )
                 .join(EscalationRequest, EscalationRequest.incident_id == Incident.id)
-                .where(*cohort, EscalationRequest.state == EscalationState.PENDING)
+                .where(*location, EscalationRequest.state == EscalationState.PENDING)
                 .order_by(EscalationRequest.requested_at)
             )
         )
@@ -378,7 +446,7 @@ async def admin_dashboard(
                     Incident.blocked_since,
                     Incident.assigned_to,
                 )
-                .where(*cohort, Incident.status == IncidentStatus.BLOCKED)
+                .where(*location, Incident.status == IncidentStatus.BLOCKED)
                 .order_by(Incident.blocked_since)
             )
         )
@@ -395,7 +463,7 @@ async def admin_dashboard(
                 "status": row.status,
                 "count": row.count,
                 "href": link(
-                    **filters,
+                    **current_filters,
                     assigned_to=row.assigned_to or AssigneeFilter.UNASSIGNED,
                     status=row.status,
                 ),
@@ -415,4 +483,224 @@ async def admin_dashboard(
         "pending_escalations": [dict(row) for row in pending],
         "blocked": [dict(row) for row in blocked],
         "communication": await communication(db, *nonfinal),
+        "communication_health": await metrics.communication_health(
+            db, start, end, building_id
+        ),
+        "sla_compliance": await metrics.sla_compliance(db, cohort),
+        "company": await metrics.company_view(db, start, end, building_id, link),
+        "routing_health": await metrics.routing_health(db, start, end, building_id, link),
+        "triage_href": link(
+            status=IncidentStatus.OPEN,
+            assigned_to=AssigneeFilter.UNASSIGNED,
+            sort=IncidentSort.PRIORITY,
+        ),
+    }
+
+
+@router.get("/team")
+async def team_dashboard(
+    period: TeamPeriod = TeamPeriod.WEEK,
+    team_id: UUID | None = None,
+    tz: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Team lead summary (FR-14.2 to 14.6): totals vs previous period, per engineer, charts."""
+    zone = metrics.zone(tz)
+    if team_id is None:
+        team = await db.scalar(select(Team).where(Team.lead_user_id == user.id))
+        if team is None:
+            raise fail(403, "forbidden", "Team lead or administrator access required")
+    else:
+        team = await db.get(Team, team_id)
+        if team is None or not (is_admin(user) or team.lead_user_id == user.id):
+            raise fail(404, "not_found", "Team not found")
+    if not is_admin(user) and (team.lead_user_id != user.id or UserRole.LEAD not in user.roles):
+        raise fail(403, "forbidden", "Team lead or administrator access required")
+    days = TEAM_PERIOD_DAYS[period]
+    end = utcnow()
+    start = end - timedelta(days=days)
+    previous_start = start - timedelta(days=days)
+    members = (
+        await db.execute(
+            select(User.id, User.full_name, EngineerProfile.availability)
+            .join(EngineerProfile, EngineerProfile.user_id == User.id)
+            .where(
+                EngineerProfile.team_id == team.id,
+                EngineerProfile.is_active.is_(True),
+                User.is_active.is_(True),
+            )
+            .order_by(User.full_name, User.id)
+        )
+    ).all()
+    member_ids = [row.id for row in members]
+    member_text = [str(item) for item in member_ids]
+    resolver = metrics.latest_resolver()
+
+    async def window(lo, hi) -> dict:
+        assigned = await db.scalar(
+            select(func.count(IncidentEvent.id)).where(
+                IncidentEvent.type == IncidentEventType.ASSIGNED,
+                IncidentEvent.payload["assignee"].astext.in_(member_text),
+                IncidentEvent.created_at >= lo,
+                IncidentEvent.created_at < hi,
+            )
+        )
+        stats = await metrics.resolution_stats(
+            db,
+            Incident.resolved_at >= lo,
+            Incident.resolved_at < hi,
+            resolver.c.resolver.in_(member_text),
+            join_resolver=resolver,
+        )
+        reopened = await db.scalar(
+            select(func.count(IncidentEvent.id))
+            .join(Incident, Incident.id == IncidentEvent.incident_id)
+            .where(
+                Incident.assigned_to.in_(member_ids),
+                IncidentEvent.type == IncidentEventType.STATUS_CHANGED,
+                IncidentEvent.payload["from"].astext == IncidentStatus.RESOLVED,
+                IncidentEvent.payload["to"].astext == IncidentStatus.IN_PROGRESS,
+                IncidentEvent.created_at >= lo,
+                IncidentEvent.created_at < hi,
+            )
+        )
+        closed = await db.scalar(
+            select(func.count(Incident.id)).where(
+                Incident.assigned_to.in_(member_ids),
+                Incident.closed_at >= lo,
+                Incident.closed_at < hi,
+            )
+        )
+        returned = await db.scalar(
+            select(func.count(IncidentEvent.id)).where(
+                IncidentEvent.type == IncidentEventType.UNASSIGNED,
+                IncidentEvent.payload["via"].astext == "returned_to_triage",
+                IncidentEvent.payload["previous_assignee"].astext.in_(member_text),
+                IncidentEvent.created_at >= lo,
+                IncidentEvent.created_at < hi,
+            )
+        )
+        ack = await db.scalar(
+            select(
+                func.avg(func.extract("epoch", Incident.acknowledged_at - Incident.created_at))
+                .cast(Float)
+            ).where(
+                Incident.assigned_to.in_(member_ids),
+                Incident.acknowledged_at >= lo,
+                Incident.acknowledged_at < hi,
+            )
+        )
+        return {
+            "assigned": assigned,
+            "resolved": stats["count"],
+            "reopened": reopened,
+            "closed": closed,
+            "returned_to_triage": returned,
+            "avg_ack_seconds": ack,
+            "avg_resolve_seconds": stats["mean_seconds"],
+            "on_time_ratio": stats["on_time_ratio"],
+        }
+
+    current = await window(start, end)
+    before = await window(previous_start, start)
+    totals = {key: metrics.delta(value, before[key]) for key, value in current.items()}
+    for key, statuses in [
+        ("open_now", NON_FINAL_STATUSES),
+        ("blocked_now", (IncidentStatus.BLOCKED,)),
+    ]:
+        totals[key] = {
+            "value": await db.scalar(
+                select(func.count(Incident.id)).where(
+                    Incident.assigned_to.in_(member_ids), Incident.status.in_(statuses)
+                )
+            ),
+            "previous": None,
+            "change": None,
+            "href": link(team_id=team.id, status=statuses),
+        }
+    engineers = []
+    for row in members:
+        stats = await metrics.resolution_stats(
+            db,
+            Incident.resolved_at >= start,
+            Incident.resolved_at < end,
+            resolver.c.resolver == str(row.id),
+            join_resolver=resolver,
+        )
+        engineers.append(
+            {
+                "user_id": row.id,
+                "full_name": row.full_name,
+                "availability": row.availability,
+                "resolved": stats["count"],
+                "avg_resolve_seconds": stats["mean_seconds"],
+                "on_time_ratio": stats["on_time_ratio"],
+                "open_now": await db.scalar(
+                    select(func.count(Incident.id)).where(
+                        Incident.assigned_to == row.id,
+                        Incident.status.in_(NON_FINAL_STATUSES),
+                    )
+                ),
+                "reopens": await db.scalar(
+                    select(func.count(IncidentEvent.id))
+                    .join(Incident, Incident.id == IncidentEvent.incident_id)
+                    .where(
+                        Incident.assigned_to == row.id,
+                        IncidentEvent.type == IncidentEventType.STATUS_CHANGED,
+                        IncidentEvent.payload["from"].astext == IncidentStatus.RESOLVED,
+                        IncidentEvent.payload["to"].astext == IncidentStatus.IN_PROGRESS,
+                        IncidentEvent.created_at >= start,
+                        IncidentEvent.created_at < end,
+                    )
+                ),
+                "href": link(
+                    # The count credits the latest resolver, not the current assignee.
+                    resolved_by=row.id,
+                    resolved_from=start.isoformat(),
+                    resolved_to=end.isoformat(),
+                ),
+            }
+        )
+    resolved_rows = (
+        await db.execute(
+            select(Incident.resolved_at, func.coalesce(Category.parent_id, Category.id))
+            .join(resolver, resolver.c.incident_id == Incident.id)
+            .join(Category, Category.id == Incident.category_id)
+            .where(
+                Incident.resolved_at >= start,
+                Incident.resolved_at < end,
+                resolver.c.resolver.in_(member_text),
+            )
+        )
+    ).all()
+    by_category: dict = {}
+    for _, top_id in resolved_rows:
+        by_category[top_id] = by_category.get(top_id, 0) + 1
+    names = dict(
+        (await db.execute(select(Category.id, Category.name).where(
+            Category.id.in_(list(by_category) or [None])
+        ))).all()
+    )
+    on_duty = sum(1 for row in members if row.availability != EngineerAvailability.OFF_DUTY)
+    return {
+        "team": {"id": team.id, "name": team.name, "members_on_duty": on_duty},
+        "period": {
+            "name": period,
+            "from": start,
+            "to": end,
+            "previous_from": previous_start,
+            "tz": zone.key,
+        },
+        "totals": totals,
+        "engineers": engineers,
+        "charts": {
+            "resolved_over_time": metrics.buckets(
+                [row[0] for row in resolved_rows], start, end, zone, period != TeamPeriod.WEEK
+            ),
+            "resolved_by_category": [
+                {"category_id": key, "name": names.get(key), "count": value}
+                for key, value in sorted(by_category.items(), key=lambda item: -item[1])
+            ],
+        },
     }

@@ -32,6 +32,7 @@ class UserRole(StrEnum):
     """Stored additive roles; Employee remains implicit for every user."""
 
     ENGINEER = "engineer"
+    LEAD = "lead"
     ADMIN = "admin"
 
 
@@ -41,6 +42,19 @@ class EngineerAvailability(StrEnum):
     AVAILABLE = "Available"
     BUSY = "Busy"
     OFF_DUTY = "Off-duty"
+
+
+class EngineerSkill(StrEnum):
+    """Engineer specialties, one per top-level incident category except "Other"."""
+
+    IT_AV_EQUIPMENT = "IT and AV equipment"
+    NETWORK_WIFI = "Network and Wi-Fi"
+    FURNITURE = "Furniture"
+    HVAC_TEMPERATURE = "HVAC and temperature"
+    ELECTRICAL_LIGHTING = "Electrical and lighting"
+    PLUMBING_RESTROOMS = "Plumbing and restrooms"
+    CLEANING = "Cleaning"
+    ACCESS_SECURITY = "Access and security"
 
 
 class NoteVisibility(StrEnum):
@@ -87,6 +101,7 @@ class IncidentEventType(StrEnum):
     NOTE_HIDDEN = "note_hidden"
     DUPLICATE_MARKED = "duplicate_marked"
     AUTO_CLOSED = "auto_closed"
+    ATTACHMENT_ADDED = "attachment_added"
 
 
 class IncidentScope(StrEnum):
@@ -103,6 +118,7 @@ class IncidentSort(StrEnum):
     CREATED = "created"
     UPDATED = "updated"
     PRIORITY = "priority"
+    SLA_DUE = "sla_due"
 
 
 class SortDirection(StrEnum):
@@ -124,6 +140,78 @@ class EscalationFilter(StrEnum):
     NONE = "none"
 
 
+class TriageFilter(StrEnum):
+    """A query sentinel for tickets in triage with no recorded reason."""
+
+    NONE = "none"
+
+
+class TriageReason(StrEnum):
+    """Why an unassigned ticket waits in the admin triage queue."""
+
+    UNROUTED_GROUP = "unrouted_group"
+    NO_ENGINEER = "no_engineer"
+    RETURNED = "returned"
+
+
+class CloseKind(StrEnum):
+    """How a ticket reached Closed."""
+
+    CONFIRMED = "confirmed"
+    ADMIN = "admin"
+    AUTO = "auto"
+    DUPLICATE = "duplicate"
+
+
+class SlaState(StrEnum):
+    """Computed SLA health; never stored."""
+
+    ON_TRACK = "on_track"
+    AT_RISK = "at_risk"
+    BREACHED = "breached"
+    MET = "met"
+    MISSED = "missed"
+
+
+class NotificationType(StrEnum):
+    """In-app notification categories."""
+
+    STATUS_CHANGED = "status_changed"
+    ASSIGNED = "assigned"
+    UNASSIGNED = "unassigned"
+    RETURNED_TO_TRIAGE = "returned_to_triage"
+    NOTE_ADDED = "note_added"
+    ESCALATION_DECIDED = "escalation_decided"
+    DUPLICATE_MARKED = "duplicate_marked"
+    SLA_AT_RISK = "sla_at_risk"
+    SLA_BREACHED = "sla_breached"
+
+
+class AttachmentStatus(StrEnum):
+    """Upload lifecycle: presigned, verified, or refused."""
+
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class AttachmentType(StrEnum):
+    """Accepted image media types."""
+
+    JPEG = "image/jpeg"
+    PNG = "image/png"
+    WEBP = "image/webp"
+    HEIC = "image/heic"
+
+
+class TeamPeriod(StrEnum):
+    """Team lead summary windows."""
+
+    WEEK = "week"
+    MONTH = "month"
+    QUARTER = "quarter"
+
+
 class APIErrorCode(StrEnum):
     """Stable machine-readable error codes returned to API clients."""
 
@@ -139,6 +227,20 @@ class APIErrorCode(StrEnum):
     REQUEST_ERROR = "request_error"
 
 
+MAX_ENGINEER_SKILLS = 2
+REQUIRED_ENGINEER_SKILLS = 2
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
+AUTO_CLOSE_HOURS = 72
+SLA_AT_RISK_FRACTION = 0.75
+# (acknowledge, resolve) windows in hours, PRD section 7.
+SLA_HOURS = {
+    IncidentPriority.CRITICAL: (1, 4),
+    IncidentPriority.HIGH: (4, 24),
+    IncidentPriority.MEDIUM: (24, 72),
+    IncidentPriority.LOW: (48, 120),
+}
+TEAM_PERIOD_DAYS = {TeamPeriod.WEEK: 7, TeamPeriod.MONTH: 30, TeamPeriod.QUARTER: 90}
 FINAL_STATUSES = frozenset({IncidentStatus.CLOSED, IncidentStatus.CANCELLED})
 NON_FINAL_STATUSES = (
     IncidentStatus.OPEN,

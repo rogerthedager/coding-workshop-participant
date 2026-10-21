@@ -30,13 +30,13 @@ async def test_frozen_migration_runs_on_empty_schema_twice(db):
             command.upgrade(config, "head")
 
         await connection.run_sync(migrate)
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
         assert await connection.scalar(text("SELECT nextval('incident_number_seq')")) == 1
         tables = await connection.scalar(
             text("SELECT count(*) FROM information_schema.tables WHERE table_schema=:schema"),
             {"schema": schema},
         )
-        assert tables == 12  # eleven entities plus the Alembic version table
+        assert tables == 17  # sixteen entities plus the Alembic version table
         indexes = await connection.scalar(
             text(
                 "SELECT count(*) FROM pg_indexes WHERE schemaname=:schema AND indexname='ix_incidents_search'"

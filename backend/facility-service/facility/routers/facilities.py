@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from facility.database import get_db
 from facility.dependencies import current_user, require_admin
 from facility.enums import FINAL_STATUSES
-from facility.models import Building, Category, Floor, Incident, Seat, User
+from facility.errors import fail
+from facility.models import Building, Category, CategoryGroup, Floor, Incident, Seat, User
 
 router = APIRouter(tags=["facilities"], dependencies=[Depends(current_user)])
 
@@ -60,6 +61,15 @@ class SeatCreate(Input):
     code: str = Field(min_length=1, max_length=40)
 
 
+class SeatBulkCreate(Input):
+    """Create prefix + zero-padded numbers for every number in [from, to]."""
+
+    prefix: str = Field(default="", max_length=30)
+    start: int = Field(alias="from", ge=0, le=99999)
+    end: int = Field(alias="to", ge=0, le=99999)
+    pad: int = Field(default=2, ge=0, le=6)
+
+
 class SeatUpdate(Input):
     """Editable seat fields."""
 
@@ -72,6 +82,7 @@ class CategoryCreate(Input):
 
     name: str = Field(min_length=1, max_length=120)
     parent_id: UUID | None = None
+    group_id: UUID | None = None
     sort_order: int = Field(default=0, ge=0, le=10000)
 
 
@@ -81,6 +92,7 @@ class CategoryUpdate(Input):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     sort_order: int | None = Field(default=None, ge=0, le=10000)
     is_active: bool | None = None
+    group_id: UUID | None = None
 
 
 def record(value: Any) -> dict:
@@ -109,12 +121,49 @@ async def guard_location(db: AsyncSession, condition: Any) -> None:
         .where(condition, Incident.status.not_in(FINAL_STATUSES))
     )
     if count:
-        raise HTTPException(409, {"message": "Location has non-final incidents", "count": count})
+        raise fail(409, "has_open_incidents", "Location has non-final incidents", count=count)
 
 
-def update_fields(item: Any, payload: BaseModel) -> None:
+async def ensure_unique(
+    db: AsyncSession, column: Any, value: str | None, *scope: Any, exclude: UUID | None = None
+) -> None:
+    """Case-insensitive uniqueness, as the design specifies (`lower(code)` indexes)."""
+    if value is None:
+        return
+    statement = select(column.class_.id).where(func.lower(column) == value.lower(), *scope)
+    if exclude is not None:
+        statement = statement.where(column.class_.id != exclude)
+    if await db.scalar(statement.limit(1)):
+        raise fail(409, "duplicate", f"That {column.key} is already in use", field=column.key)
+
+
+def siblings(parent_id: UUID | None) -> Any:
+    """Categories that share a parent (or are all top-level)."""
+    return Category.parent_id.is_(None) if parent_id is None else Category.parent_id == parent_id
+
+
+def like_pattern(text_value: str) -> str:
+    """Treat % and _ in search text literally."""
+    escaped = text_value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+async def check_group(db: AsyncSession, group_id: UUID | None) -> None:
+    """A category may only join an existing, active category group."""
+    if group_id is None:
+        return
+    group = await db.get(CategoryGroup, group_id)
+    if group is None:
+        raise HTTPException(422, "Category group not found")
+    if not group.is_active:
+        raise fail(422, "group_inactive", "Choose an active category group")
+
+
+def update_fields(item: Any, payload: BaseModel, skip: frozenset | set = frozenset()) -> None:
     """Apply supplied fields; reject null on required attributes."""
     for key, value in payload.model_dump(exclude_unset=True).items():
+        if key in skip:
+            continue
         if value is None and key != "address":
             raise HTTPException(422, f"{key} cannot be null")
         setattr(item, key, value)
@@ -127,7 +176,10 @@ async def list_buildings(
     """List buildings, including inactive records for historical administration."""
     if page < 1 or not 1 <= page_size <= 100:
         raise HTTPException(422, "Invalid pagination")
-    condition = Building.name.ilike(f"%{q}%") | Building.code.ilike(f"%{q}%")
+    pattern = like_pattern(q)
+    condition = Building.name.ilike(pattern, escape="\\") | Building.code.ilike(
+        pattern, escape="\\"
+    )
     total = await db.scalar(select(func.count()).select_from(Building).where(condition))
     rows = (
         await db.scalars(
@@ -153,6 +205,8 @@ async def create_building(
     admin: User = Depends(require_admin),
 ) -> dict:
     """Create a building without overwriting existing reference data."""
+    await ensure_unique(db, Building.name, payload.name)
+    await ensure_unique(db, Building.code, payload.code)
     item = Building(**payload.model_dump())
     db.add(item)
     await db.commit()
@@ -170,6 +224,8 @@ async def patch_building(
     item = await get_locked(db, Building, item_id)
     if payload.is_active is False:
         await guard_location(db, Incident.building_id == item_id)
+    await ensure_unique(db, Building.name, payload.name, exclude=item_id)
+    await ensure_unique(db, Building.code, payload.code, exclude=item_id)
     update_fields(item, payload)
     await db.commit()
     return record(item)
@@ -265,10 +321,50 @@ async def create_seat(
     floor = await get_locked(db, Floor, floor_id)
     if not building.is_active or not floor.is_active:
         raise HTTPException(409, "Location is inactive")
+    await ensure_unique(db, Seat.code, payload.code, Seat.floor_id == floor_id)
     item = Seat(floor_id=floor_id, **payload.model_dump())
     db.add(item)
     await db.commit()
     return record(item)
+
+
+@router.post("/floors/{floor_id}/seats/bulk", status_code=201)
+async def bulk_create_seats(
+    floor_id: UUID,
+    payload: SeatBulkCreate,
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Create up to 200 seats at once; any collision creates nothing."""
+    if payload.end < payload.start or payload.end - payload.start + 1 > 200:
+        raise HTTPException(422, "Use from <= to and at most 200 seats per call")
+    existing = await db.get(Floor, floor_id)
+    if existing is None:
+        raise HTTPException(404, "Floor not found")
+    building = await get_locked(db, Building, existing.building_id)
+    floor = await get_locked(db, Floor, floor_id)
+    if not building.is_active or not floor.is_active:
+        raise HTTPException(409, "Location is inactive")
+    codes = [
+        f"{payload.prefix}{number:0{payload.pad}d}"
+        for number in range(payload.start, payload.end + 1)
+    ]
+    if any(len(code) > 40 for code in codes):
+        raise HTTPException(422, "Seat codes must be at most 40 characters")
+    taken = (
+        await db.scalars(
+            select(Seat.code).where(
+                Seat.floor_id == floor_id,
+                func.lower(Seat.code).in_([code.lower() for code in codes]),
+            )
+        )
+    ).all()
+    if taken:
+        raise fail(409, "duplicate", "Some seat codes already exist", codes=sorted(taken))
+    items = [Seat(floor_id=floor_id, code=code) for code in codes]
+    db.add_all(items)
+    await db.commit()
+    return {"items": [record(item) for item in items], "total": len(items)}
 
 
 @router.patch("/seats/{item_id}")
@@ -290,6 +386,9 @@ async def patch_seat(
         raise HTTPException(409, "Reactivate ancestors first")
     if payload.is_active is False:
         await guard_location(db, Incident.seat_id == item_id)
+    await ensure_unique(
+        db, Seat.code, payload.code, Seat.floor_id == item.floor_id, exclude=item_id
+    )
     update_fields(item, payload)
     await db.commit()
     return record(item)
@@ -348,6 +447,10 @@ async def create_category(
         parent = await get_locked(db, Category, payload.parent_id)
         if parent.parent_id is not None or not parent.is_active:
             raise HTTPException(409, "Parent must be an active top-level category")
+        if payload.group_id is not None:
+            raise HTTPException(422, "Subcategories inherit their parent's group")
+    await check_group(db, payload.group_id)
+    await ensure_unique(db, Category.name, payload.name, siblings(payload.parent_id))
     item = Category(**payload.model_dump())
     db.add(item)
     await db.commit()
@@ -370,6 +473,14 @@ async def patch_category(
         if payload.is_active is True and not parent.is_active:
             raise HTTPException(409, "Reactivate parent category first")
     item = await get_locked(db, Category, item_id)
-    update_fields(item, payload)
+    await ensure_unique(
+        db, Category.name, payload.name, siblings(item.parent_id), exclude=item_id
+    )
+    if "group_id" in payload.model_fields_set:
+        if item.parent_id is not None:
+            raise HTTPException(422, "Subcategories inherit their parent's group")
+        await check_group(db, payload.group_id)
+        item.group_id = payload.group_id
+    update_fields(item, payload.model_copy(update={"group_id": None}), skip={"group_id"})
     await db.commit()
     return record(item)

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = []
     access_minutes: int = 15
     refresh_days: int = 7
+    # Private image bucket; empty disables attachments (endpoints return 503).
+    attachments_bucket: str = ""
+    # Optional S3-compatible endpoint (MinIO) for local development.
+    attachments_endpoint_url: str = ""
 
     @field_validator("database_url")
     @classmethod

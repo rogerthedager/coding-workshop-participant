@@ -1,0 +1,27 @@
+/* Kanban board (FR-8.2–8.5). */
+.board { display: grid; grid-template-columns: repeat(var(--cols, 4), minmax(220px, 1fr)); gap: 16px; align-items: start; overflow-x: auto; padding-bottom: 4px; }
+.board-col { background: var(--line-2); border: 2px solid transparent; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 160px; transition: opacity .15s, border-color .15s; }
+.board-col.readonly { background: var(--gray-soft); }
+.board-col.dim { opacity: .4; }
+.board-col.target { border-style: dashed; border-color: var(--blue); }
+.board-col.over { background: var(--blue-soft); border-style: solid; }
+.board-col-head { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.board-count { display: inline-flex; min-width: 22px; justify-content: center; padding: 1px 7px; border-radius: 999px; background: #fff; color: var(--ink-2); font-size: 12px; font-weight: 500; }
+.board-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.board-empty { margin: 0; padding: 16px 4px; text-align: center; color: var(--muted); font-size: 13px; }
+.board-card { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.board-card[draggable="true"] { cursor: grab; }
+.board-card.dragging { opacity: .5; }
+.board-card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.board-card-title { margin: 0; font-size: 14px; font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
+.board-card-meta { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.board-card-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.board-assignee { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.avatar.sm { width: 28px; height: 28px; font-size: 11px; }
+.board-move { min-height: 36px; font-size: 13px; max-width: 100%; }
+.board-toggle { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; font-size: 14px; font-weight: 500; cursor: pointer; }
+.board-toggle input { width: 18px; height: 18px; }
+.board-live:empty { display: none; }
+.board-narrow { display: flex; flex-direction: column; gap: 12px; }
+.board-narrow .tabs { flex-wrap: nowrap; overflow-x: auto; }
+.board-narrow .tabs button { white-space: nowrap; padding: 0 12px; }

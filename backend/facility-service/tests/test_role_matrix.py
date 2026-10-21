@@ -324,6 +324,7 @@ async def test_people_dashboard_and_session_role_matrix(
                     "email": f"matrix-engineer-{index}@acme.inc",
                     "full_name": "Matrix Engineer",
                     "phone": "555-0102",
+                    "skills": ["Furniture", "Cleaning"],
                     "temporary_password": "TemporaryPass-991!",
                 },
             )

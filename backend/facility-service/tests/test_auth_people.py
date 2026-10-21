@@ -371,6 +371,7 @@ async def test_temporary_password_restriction_and_session_revocation(
             "email": "temporary@acme.inc",
             "full_name": "New Engineer",
             "phone": "555-0109",
+            "skills": ["Furniture", "Cleaning"],
         },
     )
     assert created.status_code == 201, created.text
@@ -387,7 +388,8 @@ async def test_temporary_password_restriction_and_session_revocation(
     old_refresh = client.cookies.get("facility_refresh")
     assert (await client.get("/api/v1/auth/me", headers=old_headers)).status_code == 200
     assert (await client.get("/api/v1/engineers", headers=old_headers)).status_code == 403
-    assert (await client.post("/api/v1/auth/refresh")).status_code == 403
+    # Refresh stays available so a reload does not end the forced change flow.
+    assert (await client.post("/api/v1/auth/refresh")).status_code == 200
     changed = await client.post(
         "/api/v1/auth/change-password",
         headers=old_headers,
@@ -496,6 +498,7 @@ async def test_engineer_existing_account_availability_and_logical_delete(
         json={
             "email": employee.email,
             "full_name": "Employee Engineer",
+            "skills": ["Furniture", "Cleaning"],
         },
     )
     assert added.status_code == 201, added.text
@@ -508,6 +511,7 @@ async def test_engineer_existing_account_availability_and_logical_delete(
             json={
                 "email": employee.email,
                 "full_name": "Employee Engineer",
+                "skills": ["Furniture", "Cleaning"],
             },
         )
     ).status_code == 409
@@ -603,7 +607,7 @@ async def test_wrong_current_password_and_malformed_bearer(client, employee, aut
                 "new_password": "Different-Passphrase-909!",
             },
         )
-    ).status_code == 401
+    ).status_code == 422
     assert (
         await client.get("/api/v1/auth/me", headers={"Authorization": "Bearer invalid"})
     ).status_code == 401

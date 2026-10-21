@@ -7,3 +7,7 @@ select = ["E4", "E7", "E9", "F", "I", "B"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Header"]
+
+[tool.coverage.run]
+# The async SQLAlchemy engine runs ORM code in greenlets; without this, coverage misses it.
+concurrency = ["greenlet", "thread"]

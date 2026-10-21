@@ -1,12 +1,16 @@
 """Facility incidents, lifecycle, communication and escalation endpoints."""
 
+import csv
+import inspect
+import io
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import case, func, literal_column, or_, select, text
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from sqlalchemy import case, exists, func, literal_column, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
@@ -18,6 +22,8 @@ from ..enums import (
     VALID_TRANSITIONS,
     AssigneeFilter,
     BlockedReason,
+    CloseKind,
+    EngineerAvailability,
     EscalationFilter,
     EscalationState,
     IncidentEventType,
@@ -26,9 +32,13 @@ from ..enums import (
     IncidentSort,
     IncidentStatus,
     NoteVisibility,
+    SlaState,
     SortDirection,
+    TriageFilter,
+    TriageReason,
     UserRole,
 )
+from ..errors import fail
 from ..models import (
     Building,
     Category,
@@ -37,22 +47,30 @@ from ..models import (
     Floor,
     Incident,
     IncidentEvent,
+    IncidentFollower,
     IncidentNote,
     Seat,
+    Team,
     User,
     utcnow,
 )
+from ..notifications import commit
 from ..permissions import (
+    Rel,
     can_staff,
     check_match,
     event,
     is_admin,
     load_incident,
     readable_clause,
+    relationship,
     require_nonfinal,
     require_permission,
     touch,
 )
+from ..routing import route_new_incident
+from ..sla import next_due_sql, sla_state, sla_state_sql
+from ..workflow import supersede_pending
 
 router = APIRouter(tags=["incidents"])
 Db = Annotated[AsyncSession, Depends(get_db)]
@@ -70,8 +88,9 @@ class IncidentCreate(Payload):
     title: str = Field(min_length=5, max_length=120)
     description: str = Field(min_length=10, max_length=5000)
     category_id: UUID
-    building_id: UUID
-    floor_id: UUID
+    # Omit the whole location to use the reporter's default seat (FR-5.2).
+    building_id: UUID | None = None
+    floor_id: UUID | None = None
     seat_id: UUID | None = None
     requested_priority: IncidentPriority = IncidentPriority.MEDIUM
 
@@ -88,6 +107,7 @@ class IncidentPatch(Payload):
 class Assignment(Payload):
     assigned_to: UUID | None
     reason: str | None = Field(default=None, min_length=1, max_length=500)
+    confirm_unavailable: StrictBool = False
 
 
 class PriorityChange(Payload):
@@ -125,6 +145,7 @@ class EscalationDecision(Payload):
     decision_reason: str | None = Field(default=None, min_length=1, max_length=500)
     action_plan: str | None = Field(default=None, min_length=1, max_length=5000)
     assigned_to: UUID | None = None
+    confirm_unavailable: StrictBool = False
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -161,8 +182,28 @@ async def _latest_escalation(db: AsyncSession, incident_id: UUID) -> EscalationR
     )
 
 
-async def incident_projection(db: AsyncSession, incident: Incident, user: User) -> dict[str, Any]:
-    """Project a readable ticket without disclosing internal communication."""
+FOLLOWER_HIDDEN = {"description", "created_by", "requested_priority", "latest_escalation"}
+
+
+async def people_names(db: AsyncSession, ids: Any, hide: UUID | None = None) -> dict[str, str]:
+    """Display names for the users a response refers to (IDs alone mean nothing to
+    non-admins). The identity hidden from this reader is left out."""
+    wanted = {UUID(str(item)) for item in ids if item}
+    wanted.discard(hide)
+    if not wanted:
+        return {}
+    rows = await db.execute(select(User.id, User.full_name).where(User.id.in_(wanted)))
+    return {str(key): name for key, name in rows.all()}
+
+
+async def incident_projection(
+    db: AsyncSession, incident: Incident, user: User, rel: Rel | None = None
+) -> dict[str, Any]:
+    """Project a readable ticket without disclosing internal communication.
+
+    Followers get a reduced projection: no description and no creator identity.
+    """
+    rel = rel or await relationship(db, user, incident)
     fields = (
         "id",
         "number",
@@ -186,6 +227,13 @@ async def incident_projection(db: AsyncSession, incident: Incident, user: User) 
         "closed_at",
         "cancelled_at",
         "reopen_count",
+        "close_kind",
+        "duplicate_of_id",
+        "routed_team_id",
+        "triage_reason",
+        "route_return_count",
+        "ack_due_at",
+        "resolve_due_at",
         "created_at",
         "updated_at",
     )
@@ -223,11 +271,25 @@ async def incident_projection(db: AsyncSession, incident: Incident, user: User) 
                 result["latest_escalation"]["decision_reason"] = note.body
             elif latest.action_plan:
                 result["latest_escalation"]["action_plan"] = note.body
+    state = sla_state(incident)
+    result["sla_state"] = state.value if state else None
     result["permissions"] = {
         "staff": can_staff(user, incident),
-        "creator": incident.created_by == user.id,
-        "admin": is_admin(user),
+        "staff_read": rel.staff_read,
+        "creator": rel.creator,
+        "admin": rel.admin,
+        "follower": rel.follower,
+        "team_lead": rel.team_lead,
     }
+    result["following"] = rel.follower
+    result["people"] = await people_names(
+        db,
+        [incident.created_by, incident.assigned_to, latest.requester_id if latest else None],
+        hide=hidden_identity(incident, rel),
+    )
+    if rel.follower_only:
+        for key in FOLLOWER_HIDDEN:
+            result.pop(key, None)
     return result
 
 
@@ -236,7 +298,7 @@ async def _finish(
 ) -> dict[str, Any]:
     await db.flush()
     result = await incident_projection(db, incident, user)
-    await db.commit()
+    await commit(db)
     response.headers["ETag"] = f'"{result["updated_at"]}"'
     return result
 
@@ -244,7 +306,7 @@ async def _finish(
 async def _validate_selection(
     db: AsyncSession,
     building_id: UUID,
-    floor_id: UUID,
+    floor_id: UUID | None,
     seat_id: UUID | None,
     category_id: UUID,
     validate_location: bool = True,
@@ -255,12 +317,16 @@ async def _validate_selection(
         building = await db.scalar(
             select(Building).where(Building.id == building_id).with_for_update()
         )
-        floor = await db.scalar(select(Floor).where(Floor.id == floor_id).with_for_update())
         if not building or not building.is_active:
             raise HTTPException(422, "An active building is required")
-        if not floor or not floor.is_active or floor.building_id != building.id:
-            raise HTTPException(422, "Floor must be active and belong to the building")
+        floor = None
+        if floor_id is not None:
+            floor = await db.scalar(select(Floor).where(Floor.id == floor_id).with_for_update())
+            if not floor or not floor.is_active or floor.building_id != building.id:
+                raise HTTPException(422, "Floor must be active and belong to the building")
         if seat_id is not None:
+            if floor is None:
+                raise HTTPException(422, "Select a floor before selecting a seat")
             seat = await db.scalar(select(Seat).where(Seat.id == seat_id).with_for_update())
             if not seat or not seat.is_active or seat.floor_id != floor.id:
                 raise HTTPException(422, "Seat must be active and belong to the floor")
@@ -323,12 +389,22 @@ async def _active_engineer(db: AsyncSession, user_id: UUID) -> EngineerProfile:
     return profile
 
 
-def note_projection(note: IncidentNote) -> dict[str, Any]:
+def masked_id(user_id: UUID | None, hidden: UUID | None) -> str | None:
+    """Return a user ID unless it is the identity hidden from this reader."""
+    return None if user_id is None or user_id == hidden else str(user_id)
+
+
+def hidden_identity(incident: Incident, rel: Rel) -> UUID | None:
+    """Followers must not learn who reported the ticket (FR-5.3)."""
+    return incident.created_by if rel.follower_only else None
+
+
+def note_projection(note: IncidentNote, hide: UUID | None = None) -> dict[str, Any]:
     """Hidden notes expose a tombstone and never expose their stored body."""
     result = {
         "id": str(note.id),
         "incident_id": str(note.incident_id),
-        "author_id": str(note.author_id),
+        "author_id": masked_id(note.author_id, hide),
         "visibility": note.visibility,
         "created_at": _iso(note.created_at),
         "updated_at": _iso(note.updated_at),
@@ -346,7 +422,9 @@ def note_projection(note: IncidentNote) -> dict[str, Any]:
 async def _add_note(
     db: AsyncSession, incident: Incident, user: User, body: str, visibility: NoteVisibility
 ) -> IncidentNote:
-    require_permission(visibility == NoteVisibility.PUBLIC or can_staff(user, incident))
+    staff = can_staff(user, incident)
+    require_permission(staff or incident.created_by == user.id)
+    require_permission(visibility == NoteVisibility.PUBLIC or staff)
     note = IncidentNote(
         incident_id=incident.id, author_id=user.id, body=body, visibility=visibility
     )
@@ -370,6 +448,7 @@ async def _assign(
     user: User,
     assigned_to: UUID | None,
     reason: str | None,
+    confirm_unavailable: bool = False,
 ) -> None:
     previous = incident.assigned_to
     if previous == assigned_to:
@@ -382,8 +461,16 @@ async def _assign(
         if not reason:
             raise HTTPException(422, "Unassignment requires a reason")
     else:
-        await _active_engineer(db, assigned_to)
+        profile = await _active_engineer(db, assigned_to)
+        if profile.availability == EngineerAvailability.OFF_DUTY and not confirm_unavailable:
+            raise HTTPException(409, {
+                "message": "Engineer is Off-duty; explicitly confirm assignment to continue",
+                "confirmation_required": True,
+                "assigned_to": str(assigned_to),
+                "availability": profile.availability,
+            })
         incident.assigned_at = incident.assigned_at or utcnow()
+        incident.triage_reason = None
     incident.assigned_to = assigned_to
     event(
         db,
@@ -394,31 +481,11 @@ async def _assign(
             "previous_assignee": str(previous) if previous else None,
             "assignee": str(assigned_to) if assigned_to else None,
             "reason": reason,
+            "unavailable_override": bool(
+                assigned_to and profile.availability == EngineerAvailability.OFF_DUTY
+            ),
         },
     )
-
-
-async def _supersede_pending(db: AsyncSession, incident: Incident, user: User) -> None:
-    pending = await db.scalar(
-        select(EscalationRequest)
-        .where(
-            EscalationRequest.incident_id == incident.id,
-            EscalationRequest.state == EscalationState.PENDING,
-        )
-        .with_for_update()
-    )
-    if pending is not None:
-        pending.state = EscalationState.SUPERSEDED
-        pending.decided_at = utcnow()
-        pending.decided_by = user.id
-        pending.decision_reason = f"Incident became {incident.status}"
-        event(
-            db,
-            incident,
-            user,
-            IncidentEventType.ESCALATION_SUPERSEDED,
-            {"escalation_id": str(pending.id), "reason": pending.decision_reason},
-        )
 
 
 @router.post("/incidents", status_code=201)
@@ -426,6 +493,14 @@ async def create_incident(
     payload: IncidentCreate, response: Response, db: Db, user: Actor
 ) -> dict[str, Any]:
     """Report a validated issue and allocate its PostgreSQL sequence number."""
+    if payload.building_id is None:
+        if payload.floor_id is not None or payload.seat_id is not None:
+            raise fail(422, "validation_error", "building_id is required with floor_id or seat_id")
+        seat = await db.get(Seat, user.default_seat_id) if user.default_seat_id else None
+        floor = await db.get(Floor, seat.floor_id) if seat else None
+        if seat is None or floor is None:
+            raise fail(422, "location_required", "Choose a location or set a default seat")
+        payload.building_id, payload.floor_id, payload.seat_id = floor.building_id, floor.id, seat.id
     await _validate_selection(
         db, payload.building_id, payload.floor_id, payload.seat_id, payload.category_id
     )
@@ -446,7 +521,10 @@ async def create_incident(
         IncidentEventType.CREATED,
         {"status": IncidentStatus.OPEN, "priority": incident.priority},
     )
-    return await _finish(db, incident, user, response)
+    routing = await route_new_incident(db, incident)
+    result = await _finish(db, incident, user, response)
+    result["routing"] = routing
+    return result
 
 
 @router.get("/incidents")
@@ -468,6 +546,20 @@ async def list_incidents(
     unassigned: bool = False,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    resolved_from: datetime | None = None,
+    resolved_to: datetime | None = None,
+    resolved_by: UUID | None = None,
+    category_group_id: UUID | None = None,
+    team_id: UUID | None = None,
+    routed_team_id: UUID | None = None,
+    triage_reason: TriageReason | TriageFilter | None = None,
+    returned_from: datetime | None = None,
+    returned_to: datetime | None = None,
+    sla_state: Annotated[list[SlaState] | None, Query()] = None,
+    followed: bool | None = None,
+    public_note: Annotated[str | None, Query(pattern="^none$")] = None,
     sort: IncidentSort = IncidentSort.CREATED,
     direction: SortDirection = SortDirection.DESC,
     page: int = Query(default=1, ge=1),
@@ -489,6 +581,20 @@ async def list_incidents(
         "unassigned",
         "date_from",
         "date_to",
+        "created_from",
+        "created_to",
+        "resolved_from",
+        "resolved_to",
+        "resolved_by",
+        "category_group_id",
+        "team_id",
+        "routed_team_id",
+        "triage_reason",
+        "returned_from",
+        "returned_to",
+        "sla_state",
+        "followed",
+        "public_note",
         "sort",
         "direction",
         "page",
@@ -497,10 +603,23 @@ async def list_incidents(
     if set(request.query_params) - accepted:
         raise HTTPException(422, "Unsupported incident filter")
     if created_by is not None:
-        require_permission(is_admin(user))
+        if not is_admin(user):
+            raise fail(403, "filter_not_permitted", "Filter is not permitted")
+    if (routed_team_id is not None or triage_reason is not None) and not is_admin(user):
+        raise fail(403, "filter_not_permitted", "Filter is not permitted")
+    if team_id is not None and not is_admin(user):
+        led = await db.scalar(
+            select(Team.id).where(Team.id == team_id, Team.lead_user_id == user.id)
+        )
+        if led is None:
+            raise fail(403, "filter_not_permitted", "Filter is not permitted")
+    # created_from/created_to are the design's names; created_to is exclusive.
+    date_from = date_from or created_from
     if unassigned and assigned_to not in {None, AssigneeFilter.UNASSIGNED}:
         raise HTTPException(422, "Unassigned and assigned_to filters conflict")
-    for bound in (date_from, date_to):
+    for bound in (
+        date_from, date_to, created_to, resolved_from, resolved_to, returned_from, returned_to
+    ):
         if bound is not None and bound.tzinfo is None:
             raise HTTPException(422, "Date filters must include a timezone")
     if date_from and date_to and date_from > date_to:
@@ -516,8 +635,12 @@ async def list_incidents(
             literal_column("'english'"),
             Incident.title + " " + Incident.description,
         )
+        # INC-000123, inc-123 and 123 all find ticket INC-000123.
+        numeric = re.fullmatch(r"(?:inc-?)?0*(\d{1,12})", q.strip(), re.IGNORECASE)
+        number = f"INC-{int(numeric.group(1)):06d}" if numeric else None
         conditions.append(
             or_(
+                Incident.number == number,
                 func.upper(Incident.number) == q.strip().upper(),
                 document.op("@@")(func.plainto_tsquery(literal_column("'english'"), q)),
             )
@@ -546,6 +669,74 @@ async def list_incidents(
         conditions.append(Incident.created_at >= date_from)
     if date_to:
         conditions.append(Incident.created_at <= date_to)
+    if created_to:
+        conditions.append(Incident.created_at < created_to)
+    if resolved_from:
+        conditions.append(Incident.resolved_at >= resolved_from)
+    if resolved_to:
+        conditions.append(Incident.resolved_at < resolved_to)
+    if resolved_by is not None:
+        latest_resolution = (
+            select(IncidentEvent.payload["assigned_to"].astext)
+            .where(
+                IncidentEvent.incident_id == Incident.id,
+                IncidentEvent.type == IncidentEventType.STATUS_CHANGED,
+                IncidentEvent.payload["to"].astext == IncidentStatus.RESOLVED,
+            )
+            .order_by(IncidentEvent.created_at.desc(), IncidentEvent.id.desc())
+            .limit(1)
+            .correlate(Incident)
+            .scalar_subquery()
+        )
+        conditions.append(Incident.resolved_at.is_not(None))
+        conditions.append(latest_resolution == str(resolved_by))
+    if category_group_id is not None:
+        group_tops = select(Category.id).where(Category.group_id == category_group_id)
+        group_children = select(Category.id).where(Category.parent_id.in_(group_tops))
+        conditions.append(
+            or_(Incident.category_id.in_(group_tops), Incident.category_id.in_(group_children))
+        )
+    if team_id is not None:
+        members = select(EngineerProfile.user_id).where(EngineerProfile.team_id == team_id)
+        conditions.append(Incident.assigned_to.in_(members))
+    if routed_team_id is not None:
+        conditions.append(Incident.routed_team_id == routed_team_id)
+    if triage_reason == TriageFilter.NONE:
+        conditions.append(Incident.triage_reason.is_(None))
+    elif triage_reason is not None:
+        conditions.append(Incident.triage_reason == triage_reason)
+    if returned_from is not None or returned_to is not None:
+        # Tickets returned to triage in the range, wherever they are now.
+        returned = select(IncidentEvent.id).where(
+            IncidentEvent.incident_id == Incident.id,
+            IncidentEvent.type == IncidentEventType.UNASSIGNED,
+            IncidentEvent.payload["via"].astext == "returned_to_triage",
+        )
+        if returned_from is not None:
+            returned = returned.where(IncidentEvent.created_at >= returned_from)
+        if returned_to is not None:
+            returned = returned.where(IncidentEvent.created_at < returned_to)
+        conditions.append(exists(returned))
+    if sla_state:
+        conditions.append(sla_state_sql().in_([state.value for state in sla_state]))
+    if followed is not None:
+        follows = exists(
+            select(IncidentFollower.user_id).where(
+                IncidentFollower.incident_id == Incident.id,
+                IncidentFollower.user_id == user.id,
+            )
+        )
+        conditions.append(follows if followed else ~follows)
+    if public_note == "none":
+        conditions.append(
+            ~exists(
+                select(IncidentNote.id).where(
+                    IncidentNote.incident_id == Incident.id,
+                    IncidentNote.visibility == NoteVisibility.PUBLIC,
+                    IncidentNote.hidden_at.is_(None),
+                )
+            )
+        )
     if escalation is not None:
         latest_state = (
             select(EscalationRequest.state)
@@ -564,11 +755,12 @@ async def list_incidents(
         IncidentSort.CREATED: Incident.created_at,
         IncidentSort.UPDATED: Incident.updated_at,
         IncidentSort.PRIORITY: case(PRIORITY_RANK, value=Incident.priority, else_=0),
+        IncidentSort.SLA_DUE: next_due_sql(),
     }[sort]
     order = sort_column.asc() if direction == SortDirection.ASC else sort_column.desc()
     tie_break = (
         [Incident.created_at.asc(), Incident.id.asc()]
-        if sort == IncidentSort.PRIORITY
+        if sort in {IncidentSort.PRIORITY, IncidentSort.SLA_DUE}
         else [Incident.id.asc()]
     )
     total = await db.scalar(select(func.count()).select_from(Incident).where(*conditions))
@@ -587,6 +779,73 @@ async def list_incidents(
         "page": page,
         "page_size": page_size,
     }
+
+
+EXPORT_MAX_ROWS = 5000
+EXPORT_COLUMNS = (
+    "number", "title", "status", "priority", "sla_state", "category", "building",
+    "assignee", "created_at", "resolved_at", "closed_at",
+)
+FORMULA_PREFIXES = {"=", "+", "-", "@", "\t", "\r"}
+
+
+def _csv_cell(value: object) -> str:
+    """Stop spreadsheet apps from running cell text as a formula."""
+    text_value = "" if value is None else str(value)
+    return "'" + text_value if text_value[:1] in FORMULA_PREFIXES else text_value
+
+
+async def export_incidents(**params: Any) -> Response:
+    """CSV of the same authorized, filtered list as GET /incidents (stretch goal)."""
+    db: AsyncSession = params["db"]
+    rows: list[dict[str, Any]] = []
+    page = 1
+    while len(rows) < EXPORT_MAX_ROWS:
+        result = await list_incidents(**{**params, "page": page, "page_size": 100})
+        rows += result["items"]
+        if not result["items"] or len(rows) >= result["total"]:
+            break
+        page += 1
+    rows = rows[:EXPORT_MAX_ROWS]
+
+    async def names(model: Any, attr: str, ids: set[str]) -> dict[str, str]:
+        if not ids:
+            return {}
+        found = await db.execute(
+            select(model.id, getattr(model, attr)).where(model.id.in_([UUID(i) for i in ids]))
+        )
+        return {str(key): value for key, value in found.all()}
+
+    categories = await names(Category, "name", {r["category_id"] for r in rows if r.get("category_id")})
+    buildings = await names(Building, "name", {r["building_id"] for r in rows if r.get("building_id")})
+    users = await names(User, "full_name", {r["assigned_to"] for r in rows if r.get("assigned_to")})
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(EXPORT_COLUMNS)
+    for r in rows:
+        writer.writerow(
+            _csv_cell(value)
+            for value in (
+                r.get("number"), r.get("title"), r.get("status"), r.get("priority"),
+                r.get("sla_state"), categories.get(r.get("category_id")),
+                buildings.get(r.get("building_id")), users.get(r.get("assigned_to")),
+                r.get("created_at"), r.get("resolved_at"), r.get("closed_at"),
+            )
+        )
+    return Response(
+        out.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="incidents.csv"'},
+    )
+
+
+# Same parameters and validation as the list; declared before /incidents/{incident_id}.
+export_incidents.__signature__ = inspect.signature(list_incidents).replace(  # type: ignore[attr-defined]
+    return_annotation=Response
+)
+router.add_api_route(
+    "/incidents/export.csv", export_incidents, methods=["GET"], response_class=Response
+)
 
 
 @router.get("/incidents/{incident_id}")
@@ -617,8 +876,13 @@ async def update_incident(
     changes = payload.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(422, "At least one detail field is required")
-    if any(value is None for key, value in changes.items() if key != "seat_id"):
+    if any(value is None for key, value in changes.items() if key not in {"floor_id", "seat_id"}):
         raise HTTPException(422, "Required incident fields cannot be null")
+    if "building_id" in changes and changes["building_id"] != incident.building_id:
+        changes.setdefault("floor_id", None)
+        changes.setdefault("seat_id", None)
+    if "floor_id" in changes and changes["floor_id"] != incident.floor_id:
+        changes.setdefault("seat_id", None)
     selection = {
         key: changes.get(key, getattr(incident, key))
         for key in ("building_id", "floor_id", "seat_id", "category_id")
@@ -650,7 +914,9 @@ async def assign_incident(
     require_permission(is_admin(user))
     require_nonfinal(incident)
     check_match(incident, if_match)
-    await _assign(db, incident, user, payload.assigned_to, payload.reason)
+    await _assign(
+        db, incident, user, payload.assigned_to, payload.reason, payload.confirm_unavailable
+    )
     touch(incident)
     return await _finish(db, incident, user, response)
 
@@ -672,6 +938,7 @@ async def change_priority(
         raise HTTPException(409, "Incident already has that priority")
     previous = incident.priority
     incident.priority = payload.priority
+    incident.set_due_times()
     touch(incident)
     event(
         db,
@@ -709,19 +976,19 @@ async def transition_incident(
     previous = incident.status
     target = payload.status
     if (previous, target) not in VALID_TRANSITIONS:
-        raise HTTPException(409, "Invalid incident transition")
+        raise fail(409, "invalid_transition", "Invalid incident transition")
     now = utcnow()
     extra: dict[str, Any] = {}
     if target == IncidentStatus.CANCELLED:
-        if not is_admin(user) and incident.assigned_to is not None:
-            raise HTTPException(403, "Creators may cancel only unassigned incidents")
+        # Creators may cancel any Open ticket: auto-routing assigns most tickets at
+        # creation, and nobody has started work while it is Open.
         if not payload.reason:
             raise HTTPException(422, "Cancellation requires a reason")
         incident.cancelled_at = now
         extra["reason"] = payload.reason
     elif previous == IncidentStatus.OPEN and target == IncidentStatus.IN_PROGRESS:
         if incident.assigned_to is None:
-            raise HTTPException(409, "Assign an engineer before starting work")
+            raise fail(409, "no_assignee", "Assign an engineer before starting work")
         incident.first_in_progress_at = incident.first_in_progress_at or now
         incident.acknowledged_at = incident.acknowledged_at or now
     elif target == IncidentStatus.BLOCKED:
@@ -750,6 +1017,8 @@ async def transition_incident(
         )
     elif target == IncidentStatus.CLOSED:
         incident.closed_at = now
+        incident.close_kind = CloseKind.CONFIRMED if creator else CloseKind.ADMIN
+        extra["close_kind"] = incident.close_kind
     elif previous == IncidentStatus.RESOLVED:
         if not payload.note or payload.visibility != NoteVisibility.PUBLIC:
             raise HTTPException(422, "Rejecting a resolution requires a public note")
@@ -771,7 +1040,7 @@ async def transition_incident(
         {"from": previous, "to": target, **extra},
     )
     if target in FINAL_STATUSES:
-        await _supersede_pending(db, incident, user)
+        await supersede_pending(db, incident, user)
     return await _finish(db, incident, user, response)
 
 
@@ -790,10 +1059,15 @@ async def request_escalation(
     check_match(incident, if_match)
     latest = await _latest_escalation(db, incident.id)
     if latest and latest.state == EscalationState.PENDING:
-        raise HTTPException(409, "An escalation request is already pending")
+        raise fail(409, "escalation_pending", "An escalation request is already pending")
     now = utcnow()
     if latest and now < _aware(latest.requested_at) + timedelta(hours=24):
-        raise HTTPException(409, "Wait 24 hours after the prior request before escalating again")
+        raise fail(
+            409,
+            "escalation_cooldown",
+            "Wait 24 hours after the prior request before escalating again",
+            retry_after=_iso(_aware(latest.requested_at) + timedelta(hours=24)),
+        )
     entry = EscalationRequest(
         incident_id=incident.id,
         requester_id=user.id,
@@ -836,7 +1110,7 @@ async def decide_escalation(
         .with_for_update()
     )
     if entry is None:
-        raise HTTPException(409, "No pending escalation request")
+        raise fail(409, "escalation_not_pending", "No pending escalation request")
     decision_note = None
     if payload.approved:
         if incident.priority == IncidentPriority.CRITICAL:
@@ -855,6 +1129,7 @@ async def decide_escalation(
                 raise HTTPException(422, "Approval must raise priority by at least one level")
             previous = incident.priority
             incident.priority = payload.priority
+            incident.set_due_times()
             event(
                 db,
                 incident,
@@ -887,6 +1162,7 @@ async def decide_escalation(
             user,
             payload.assigned_to,
             "Escalation decision",
+            payload.confirm_unavailable,
         )
     entry.decided_by = user.id
     entry.decided_at = utcnow()
@@ -914,11 +1190,17 @@ async def decide_escalation(
 @router.get("/incidents/{incident_id}/notes")
 async def list_notes(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]:
     incident = await load_incident(db, user, incident_id)
+    rel = await relationship(db, user, incident)
     statement = select(IncidentNote).where(IncidentNote.incident_id == incident.id)
-    if not can_staff(user, incident):
+    if not rel.staff_read:
         statement = statement.where(IncidentNote.visibility == NoteVisibility.PUBLIC)
     notes = (await db.scalars(statement.order_by(IncidentNote.created_at, IncidentNote.id))).all()
-    return {"items": [note_projection(note) for note in notes], "total": len(notes)}
+    hide = hidden_identity(incident, rel)
+    return {
+        "items": [note_projection(note, hide) for note in notes],
+        "total": len(notes),
+        "people": await people_names(db, [note.author_id for note in notes], hide=hide),
+    }
 
 
 @router.post("/incidents/{incident_id}/notes", status_code=201)
@@ -931,14 +1213,16 @@ async def create_note(
     if_match: Version = None,
 ) -> dict[str, Any]:
     incident = await load_incident(db, user, incident_id, lock=True)
-    require_permission(payload.visibility == NoteVisibility.PUBLIC or can_staff(user, incident))
+    staff = can_staff(user, incident)
+    require_permission(staff or incident.created_by == user.id)
+    require_permission(payload.visibility == NoteVisibility.PUBLIC or staff)
     require_nonfinal(incident)
     check_match(incident, if_match)
     note = await _add_note(db, incident, user, payload.body, payload.visibility)
     touch(incident)
     await db.flush()
     result = note_projection(note)
-    await db.commit()
+    await commit(db)
     response.headers["ETag"] = f'"{result["updated_at"]}"'
     return result
 
@@ -960,7 +1244,8 @@ async def _load_note(db: AsyncSession, user: User, note_id: UUID) -> tuple[Incid
         .execution_options(populate_existing=True)
     )
     if note is None or (
-        note.visibility == NoteVisibility.INTERNAL and not can_staff(user, incident)
+        note.visibility == NoteVisibility.INTERNAL
+        and not (await relationship(db, user, incident)).staff_read
     ):
         raise HTTPException(404, "Note not found")
     return incident, note
@@ -976,14 +1261,16 @@ async def edit_note(
     if_match: Version = None,
 ) -> dict[str, Any]:
     incident, note = await _load_note(db, user, note_id)
+    staff = can_staff(user, incident)
     require_permission(note.author_id == user.id)
-    require_permission(note.visibility == NoteVisibility.PUBLIC or can_staff(user, incident))
+    require_permission(staff or incident.created_by == user.id)
+    require_permission(note.visibility == NoteVisibility.PUBLIC or staff)
     require_nonfinal(incident)
     check_match(note, if_match)
     if note.hidden_at is not None:
         raise HTTPException(409, "Hidden notes cannot be edited")
     if utcnow() >= _aware(note.created_at) + timedelta(minutes=10):
-        raise HTTPException(409, "The ten-minute note edit window has expired")
+        raise fail(409, "edit_window_closed", "The ten-minute note edit window has expired")
     previous_body = note.body
     note.body = payload.body
     note.edited_at = utcnow()
@@ -1005,7 +1292,7 @@ async def edit_note(
     )
     await db.flush()
     result = note_projection(note)
-    await db.commit()
+    await commit(db)
     response.headers["ETag"] = f'"{result["updated_at"]}"'
     return result
 
@@ -1042,7 +1329,7 @@ async def hide_note(
         )
     await db.flush()
     result = note_projection(note)
-    await db.commit()
+    await commit(db)
     response.headers["ETag"] = f'"{result["updated_at"]}"'
     return result
 
@@ -1051,7 +1338,9 @@ async def hide_note(
 async def get_timeline(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]:
     """Return sanitized events, checking each referenced note's current state."""
     incident = await load_incident(db, user, incident_id)
-    staff = can_staff(user, incident)
+    rel = await relationship(db, user, incident)
+    staff = rel.staff_read
+    hide = hidden_identity(incident, rel)
     events = (
         await db.scalars(
             select(IncidentEvent)
@@ -1078,6 +1367,17 @@ async def get_timeline(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]
         "escalation_id",
         "note_id",
         "visibility",
+        "via",
+        "team_id",
+        "close_kind",
+        "duplicate_of_number",
+        "attachment_id",
+    }
+    staff_only_reasons = {
+        IncidentEventType.ASSIGNED,
+        IncidentEventType.UNASSIGNED,
+        IncidentEventType.PRIORITY_CHANGED,
+        IncidentEventType.DUPLICATE_MARKED,
     }
     items = []
     for entry in events:
@@ -1089,7 +1389,17 @@ async def get_timeline(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]
             IncidentEventType.NOTE_HIDDEN,
         } and (note is None or (note.visibility == NoteVisibility.INTERNAL and not staff)):
             continue
+        if (
+            entry.type == IncidentEventType.ATTACHMENT_ADDED
+            and stored.get("visibility") == NoteVisibility.INTERNAL
+            and not staff
+        ):
+            continue
         payload = {key: value for key, value in stored.items() if key in safe_keys}
+        if not staff and entry.type in staff_only_reasons:
+            # Reassignment, priority and duplicate reasons are staff-only (N21).
+            payload.pop("reason", None)
+            payload.pop("team_id", None)
         if stored.get("visibility") == NoteVisibility.INTERNAL and not staff:
             # Workflow status itself is public; its note identity/visibility is not.
             payload.pop("note_id", None)
@@ -1110,15 +1420,22 @@ async def get_timeline(incident_id: UUID, db: Db, user: Actor) -> dict[str, Any]
             {
                 "id": str(entry.id),
                 "incident_id": str(entry.incident_id),
-                "actor_id": str(entry.actor_id) if entry.actor_id else None,
+                "actor_id": masked_id(entry.actor_id, hide),
                 "type": entry.type,
                 "payload": payload,
                 "created_at": _iso(entry.created_at),
                 **(
-                    {"note": note_projection(note)}
+                    {"note": note_projection(note, hide)}
                     if entry.type == IncidentEventType.NOTE_ADDED and note is not None
                     else {}
                 ),
             }
         )
-    return {"items": items, "total": len(items)}
+    referenced = [item["actor_id"] for item in items]
+    for item in items:
+        referenced += [item["payload"].get("assignee"), item["payload"].get("previous_assignee")]
+    return {
+        "items": items,
+        "total": len(items),
+        "people": await people_names(db, referenced, hide=hide),
+    }

@@ -116,9 +116,10 @@ async def test_populated_0001_upgrade_preserves_rows_and_storage_types(db):
         await connection.run_sync(migrate, "0001")
         ids = await insert_legacy(connection, "Waiting on parts")
         before = await fingerprints(connection)
-        await connection.run_sync(migrate, "head")
+        await connection.run_sync(migrate, "0002")
         assert await fingerprints(connection) == before
         assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002"
+        await connection.run_sync(migrate, "head")  # the current ORM model needs later columns
         columns = dict(
             (
                 await connection.execute(

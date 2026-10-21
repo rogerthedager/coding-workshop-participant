@@ -14,9 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from facility.config import settings
 from facility.database import get_db
 from facility.dependencies import authenticated_user
-from facility.models import RefreshSession, User, utcnow
+from facility.models import EngineerProfile, RefreshSession, Team, User, utcnow
 from facility.security import (
     create_access_token,
+    dummy_password_hash,
     hash_password,
     hash_refresh_token,
     new_refresh_token,
@@ -80,6 +81,7 @@ def user_output(user: User) -> dict:
         "roles": user.roles,
         "is_active": user.is_active,
         "must_change_password": user.must_change_password,
+        "default_seat_id": str(user.default_seat_id) if user.default_seat_id else None,
     }
 
 
@@ -132,13 +134,14 @@ async def issue_session(
     family_id: uuid.UUID | None = None,
 ) -> tuple[dict, RefreshSession]:
     """Add an uncommitted session and attach its opaque browser token."""
-    access = create_access_token(user)
+    family_id = family_id or uuid.uuid4()
+    access = create_access_token(user, family_id)
     raw = new_refresh_token()
     session = RefreshSession(
         id=uuid.uuid4(),
         user_id=user.id,
         token_hash=hash_refresh_token(raw),
-        family_id=family_id or uuid.uuid4(),
+        family_id=family_id,
         expires_at=utcnow() + timedelta(days=settings.refresh_days),
     )
     db.add(session)
@@ -152,8 +155,9 @@ async def issue_session(
 
 
 @router.post("/register", status_code=201)
-async def register(payload: Registration, db: Db) -> dict:
+async def register(payload: Registration, db: Db, request: Request) -> dict:
     """Register an employee with a normalized, database-unique ACME email."""
+    require_same_origin(request)
     user = User(
         email=payload.email,
         full_name=payload.full_name,
@@ -165,7 +169,9 @@ async def register(payload: Registration, db: Db) -> dict:
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(409, "An account already exists for that email") from None
+        raise HTTPException(
+            409, {"code": "duplicate_email", "message": "An account already exists for that email"}
+        ) from None
     return user_output(user)
 
 
@@ -178,9 +184,10 @@ async def login(payload: Login, response: Response, db: Db, request: Request) ->
         select(User).where(User.email == payload.email.strip().lower()).with_for_update()
     )
     now = utcnow()
-    if user is None or not user.is_active:
-        raise HTTPException(401, "Invalid email or password")
-    if user.locked_until and user.locked_until > now:
+    if user is None or not user.is_active or (user.locked_until and user.locked_until > now):
+        # Spend the same bcrypt time as a real check so timing does not reveal
+        # which accounts exist or are locked.
+        verify_password(payload.password, dummy_password_hash())
         raise HTTPException(401, "Invalid email or password")
     if not verify_password(payload.password, user.password_hash):
         window = now - timedelta(minutes=15)
@@ -201,9 +208,24 @@ async def login(payload: Login, response: Response, db: Db, request: Request) ->
 
 
 @router.get("/me")
-async def me(user: Identity) -> dict:
-    """Inspect the current account even while a password change is required."""
-    return user_output(user)
+async def me(user: Identity, db: Db) -> dict:
+    """Inspect the current account, its skills, team and led team."""
+    result = user_output(user)
+    profile = await db.scalar(select(EngineerProfile).where(EngineerProfile.user_id == user.id))
+    result["engineer"] = (
+        {
+            "profile_id": str(profile.id),
+            "is_active": profile.is_active,
+            "availability": profile.availability,
+            "skills": profile.skills,
+            "team_id": str(profile.team_id) if profile.team_id else None,
+        }
+        if profile is not None
+        else None
+    )
+    led = await db.scalar(select(Team).where(Team.lead_user_id == user.id))
+    result["leads_team"] = {"id": str(led.id), "name": led.name} if led else None
+    return result
 
 
 async def locked_refresh(
@@ -257,8 +279,6 @@ async def refresh(request: Request, response: Response, db: Db) -> dict:
         stored.revoked_at = now
         await db.commit()
         raise HTTPException(401, "Refresh session has expired")
-    if user.must_change_password:
-        raise HTTPException(403, "Change your temporary password before continuing")
     result, successor = await issue_session(db, user, response, stored.family_id)
     await db.flush()
     stored.revoked_at = now
@@ -298,8 +318,10 @@ async def change_password(
     response: Response,
     db: Db,
     user: Identity,
+    request: Request,
 ) -> dict:
     """Invalidate old sessions and replace the current session after a password change."""
+    require_same_origin(request)
     user = await db.scalar(
         select(User)
         .where(User.id == user.id)
@@ -307,7 +329,11 @@ async def change_password(
         .execution_options(populate_existing=True)
     )
     if not verify_password(payload.current_password, user.password_hash):
-        raise HTTPException(401, "Current password is incorrect")
+        # 422, not 401: a 401 tells the client its session expired.
+        raise HTTPException(
+            422,
+            {"code": "invalid_current_password", "message": "Current password is incorrect"},
+        )
     if payload.new_password == payload.current_password:
         raise HTTPException(422, "The new password must differ from the current password")
     signing_secret()
