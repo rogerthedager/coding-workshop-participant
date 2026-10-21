@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: acme_local
+      POSTGRES_DB: acme_facility_dev
+      POSTGRES_PASSWORD: ${FACILITY_POSTGRES_PASSWORD:?Set FACILITY_POSTGRES_PASSWORD to a strong local password}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    ports:
+      - "127.0.0.1:55439:5432"
+    volumes:
+      - facility-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acme_local -d acme_facility_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  facility-postgres-data:
