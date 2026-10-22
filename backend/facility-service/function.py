@@ -4,7 +4,12 @@ from copy import deepcopy
 
 from mangum import Mangum
 
+from facility.database import reuse_connections
 from facility.main import app
+
+# Mangum runs every request on one event loop per warm container, so database
+# connections can stay open between requests instead of reconnecting each time.
+reuse_connections()
 
 adapter = Mangum(app, lifespan="off")
 

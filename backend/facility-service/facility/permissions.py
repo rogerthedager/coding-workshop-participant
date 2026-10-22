@@ -107,31 +107,45 @@ def staff_read_clause(user: User) -> ColumnElement[bool]:
 
 async def relationship(db: AsyncSession, user: User, incident: Incident) -> Rel:
     """Compute every relationship from current database state."""
-    follower = bool(
-        await db.scalar(
-            select(IncidentFollower.user_id).where(
-                IncidentFollower.incident_id == incident.id,
+    return (await relationships(db, user, [incident]))[incident.id]
+
+
+async def relationships(
+    db: AsyncSession, user: User, incidents: list[Incident]
+) -> dict[UUID, Rel]:
+    """Relationships for many incidents at once: at most two queries for any count."""
+    if not incidents:
+        return {}
+    followed = set(
+        await db.scalars(
+            select(IncidentFollower.incident_id).where(
+                IncidentFollower.incident_id.in_([item.id for item in incidents]),
                 IncidentFollower.user_id == user.id,
             )
         )
     )
-    team_lead = False
-    if incident.assigned_to is not None and UserRole.LEAD in (user.roles or []):
-        team_lead = bool(
-            await db.scalar(
+    led: set[UUID] = set()
+    assignees = {item.assigned_to for item in incidents if item.assigned_to is not None}
+    if assignees and UserRole.LEAD in (user.roles or []):
+        led = set(
+            await db.scalars(
                 select(EngineerProfile.user_id).where(
-                    EngineerProfile.user_id == incident.assigned_to,
+                    EngineerProfile.user_id.in_(assignees),
                     EngineerProfile.user_id.in_(led_members(user.id)),
                 )
             )
         )
-    return Rel(
-        creator=incident.created_by == user.id,
-        follower=follower,
-        assignee=UserRole.ENGINEER in (user.roles or []) and incident.assigned_to == user.id,
-        team_lead=team_lead,
-        admin=is_admin(user),
-    )
+    engineer = UserRole.ENGINEER in (user.roles or [])
+    return {
+        item.id: Rel(
+            creator=item.created_by == user.id,
+            follower=item.id in followed,
+            assignee=engineer and item.assigned_to == user.id,
+            team_lead=item.assigned_to in led,
+            admin=is_admin(user),
+        )
+        for item in incidents
+    }
 
 
 async def load_incident(

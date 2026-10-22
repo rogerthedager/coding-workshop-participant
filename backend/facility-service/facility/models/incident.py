@@ -89,7 +89,7 @@ class Incident(Entity, Base):
         varchar_enum(IncidentPriority, 16), default=IncidentPriority.MEDIUM, index=True
     )
     created_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
-    assigned_to: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
+    assigned_to: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"))
     blocked_reason: Mapped[BlockedReason | None] = mapped_column(TextEnum(BlockedReason))
     blocked_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -158,6 +158,21 @@ Index(
     "ix_incidents_resolved_at",
     Incident.resolved_at,
     postgresql_where=text("status = 'Resolved'"),
+)
+_ACTIVE = "status IN ('Open', 'In Progress', 'Blocked')"
+# Workload per engineer and status (dashboards, auto-routing); also serves
+# plain assigned_to lookups, so it replaces the single-column index.
+Index("ix_incidents_assignee_status", Incident.assigned_to, Incident.status)
+# The SLA alert job only scans tickets whose timer is still running.
+Index(
+    "ix_incidents_active_ack_due",
+    Incident.ack_due_at,
+    postgresql_where=text(f"{_ACTIVE} AND acknowledged_at IS NULL"),
+)
+Index(
+    "ix_incidents_active_resolve_due",
+    Incident.resolve_due_at,
+    postgresql_where=text(f"{_ACTIVE} AND resolved_at IS NULL"),
 )
 
 

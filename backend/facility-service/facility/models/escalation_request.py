@@ -27,8 +27,10 @@ class EscalationRequest(Entity, Base):
             unique=True,
             postgresql_where=text(f"state = '{EscalationState.PENDING.value}'"),
         ),
+        # Latest escalation per ticket; also serves plain incident_id lookups.
+        Index("ix_escalation_requests_latest", "incident_id", "requested_at", "id"),
     )
-    incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id"), index=True)
+    incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id"))
     requester_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     reason: Mapped[str] = mapped_column(Text)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

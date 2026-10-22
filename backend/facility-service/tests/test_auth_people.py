@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy.pool import NullPool
 
 from facility import database
 from facility.config import Settings, settings
@@ -82,6 +83,31 @@ async def test_workshop_database_settings_lazy_secret_and_ssl(monkeypatch):
     monkeypatch.setattr(database, "create_async_engine", capture)
     assert database.get_engine() is not None
     assert observed["connect_args"] == {"ssl": "require"}
+    assert observed["poolclass"] is NullPool
+
+
+def test_http_entrypoint_reuses_connections_and_one_shot_jobs_do_not(monkeypatch):
+    """Only the long-lived HTTP process pools connections; asyncio.run() handlers reconnect."""
+    for name in ("_reuse", "engine", "_session_factory"):
+        monkeypatch.setattr(database, name, getattr(database, name))
+    monkeypatch.setattr(database, "_reuse", False)
+    monkeypatch.setattr(database, "engine", None)
+    monkeypatch.setattr(
+        database.settings, "database_url", "postgresql+asyncpg://test:password@private/database"
+    )
+    observed = []
+    monkeypatch.setattr(
+        database, "create_async_engine", lambda url, **kwargs: observed.append(kwargs) or object()
+    )
+    database.get_engine()
+    assert observed[-1]["poolclass"] is NullPool
+
+    database.reuse_connections()
+    assert database.engine is None, "the earlier NullPool engine is replaced"
+    database.get_engine()
+    assert "poolclass" not in observed[-1]
+    assert observed[-1]["pool_pre_ping"] is True
+    assert observed[-1]["pool_size"] >= 1
 
 
 async def test_expired_session_retention_respects_seven_day_grace(db, employee):

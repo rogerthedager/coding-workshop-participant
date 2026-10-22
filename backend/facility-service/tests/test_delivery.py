@@ -30,7 +30,7 @@ async def test_frozen_migration_runs_on_empty_schema_twice(db):
             command.upgrade(config, "head")
 
         await connection.run_sync(migrate)
-        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0005"
+        assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == "0006"
         assert await connection.scalar(text("SELECT nextval('incident_number_seq')")) == 1
         tables = await connection.scalar(
             text("SELECT count(*) FROM information_schema.tables WHERE table_schema=:schema"),
@@ -143,6 +143,11 @@ async def test_dashboard_metrics_sql_and_hidden_communication(
 
 def test_workshop_http_adapter_preserves_path_and_auth(monkeypatch):
     """The additive entrypoint preserves authentication and If-Match through prefix stripping."""
+    from facility import database
+
+    # Importing the entrypoint turns on connection reuse; undo it for later tests.
+    for name in ("_reuse", "engine", "_session_factory"):
+        monkeypatch.setattr(database, name, getattr(database, name))
     import function
 
     captured = {}

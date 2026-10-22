@@ -72,8 +72,15 @@ async def grouped(db: AsyncSession, column: object, *conditions: object) -> list
     return [{"value": value, "count": count} for value, count in rows]
 
 
-async def communication(db: AsyncSession, *conditions: object) -> list[dict]:
-    """Show last visible public note without exposing any internal note contents."""
+# The admin dashboard lists only the most stale tickets (the page shows the top 8).
+ADMIN_COMMUNICATION_LIMIT = 50
+
+
+async def communication(db: AsyncSession, *conditions: object, limit: int | None = None) -> list[dict]:
+    """Show last visible public note without exposing any internal note contents.
+
+    Oldest (or never updated) first; `limit` keeps company-wide lists small.
+    """
     last = (
         select(
             IncidentNote.incident_id, func.max(IncidentNote.created_at).label("last_public_update")
@@ -88,6 +95,7 @@ async def communication(db: AsyncSession, *conditions: object) -> list[dict]:
             .outerjoin(last, last.c.incident_id == Incident.id)
             .where(*conditions)
             .order_by(last.c.last_public_update.asc().nullsfirst(), Incident.id)
+            .limit(limit)
         )
     ).all()
     return [
@@ -499,7 +507,7 @@ async def admin_dashboard(
         ],
         "pending_escalations": [dict(row) for row in pending],
         "blocked": [dict(row) for row in blocked],
-        "communication": await communication(db, *nonfinal),
+        "communication": await communication(db, *nonfinal, limit=ADMIN_COMMUNICATION_LIMIT),
         "communication_health": await metrics.communication_health(
             db, start, end, building_id
         ),

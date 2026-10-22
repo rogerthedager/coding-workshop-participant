@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from facility.database import Base
@@ -18,6 +18,15 @@ class IncidentNote(Entity, Base):
     __tablename__ = "incident_notes"
     __table_args__ = (
         CheckConstraint(enum_check("visibility", NoteVisibility), name="ck_notes_visibility"),
+        # Dashboards ask for each ticket's latest visible public update.
+        Index(
+            "ix_incident_notes_public",
+            "incident_id",
+            "created_at",
+            postgresql_where=text(
+                f"visibility = '{NoteVisibility.PUBLIC.value}' AND hidden_at IS NULL"
+            ),
+        ),
     )
     incident_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("incidents.id"), index=True)
     author_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))

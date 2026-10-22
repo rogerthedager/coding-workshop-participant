@@ -8,7 +8,7 @@ module "lambda" {
   architectures   = [each.value.arch]
   handler         = each.value.handler
   runtime         = each.value.runtime
-  memory_size     = 128
+  memory_size     = var.aws_lambda_memory_mb
   timeout         = 300
   tracing_mode    = "PassThrough"
   build_in_docker = false

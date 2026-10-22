@@ -48,26 +48,24 @@ def zone(name: str | None) -> ZoneInfo:
 
 
 def latest_resolver():
-    """Subquery (incident_id, resolver) from each ticket's latest resolve transition."""
-    ranked = (
+    """Lateral subquery (incident_id, resolver): who the ticket's latest resolve credits.
+
+    Correlated to Incident and limited to one row, so each ticket is a single probe of
+    the ix_incident_events_resolved partial index instead of a ranking of all events.
+    """
+    return (
         select(
             IncidentEvent.incident_id.label("incident_id"),
             IncidentEvent.payload["assigned_to"].astext.label("resolver"),
-            func.row_number()
-            .over(
-                partition_by=IncidentEvent.incident_id,
-                order_by=(IncidentEvent.created_at.desc(), IncidentEvent.id.desc()),
-            )
-            .label("rank"),
         )
         .where(
+            IncidentEvent.incident_id == Incident.id,
             IncidentEvent.type == IncidentEventType.STATUS_CHANGED,
             IncidentEvent.payload["to"].astext == IncidentStatus.RESOLVED,
         )
-        .subquery()
-    )
-    return (
-        select(ranked.c.incident_id, ranked.c.resolver).where(ranked.c.rank == 1).subquery()
+        .order_by(IncidentEvent.created_at.desc(), IncidentEvent.id.desc())
+        .limit(1)
+        .lateral()
     )
 
 
@@ -90,19 +88,18 @@ def resolved_in(start: datetime, end: datetime) -> list:
     return [Incident.resolved_at >= start, Incident.resolved_at < end]
 
 
-async def resolution_stats(db: AsyncSession, *conditions: Any, join_resolver=None) -> dict:
-    """Count, mean, median resolve seconds and on-time ratio for resolved tickets."""
-    statement = select(
+def _resolution_columns() -> list:
+    return [
         func.count(Incident.id).label("count"),
         func.avg(RESOLVE_SECONDS).cast(Float).label("mean_seconds"),
         func.percentile_cont(0.5).within_group(RESOLVE_SECONDS).label("median_seconds"),
         func.count(Incident.id)
         .filter(Incident.resolved_at <= Incident.resolve_due_at)
         .label("on_time"),
-    ).where(Incident.resolved_at.is_not(None), *conditions)
-    if join_resolver is not None:
-        statement = statement.join(join_resolver, join_resolver.c.incident_id == Incident.id)
-    row = (await db.execute(statement)).mappings().one()
+    ]
+
+
+def _stats(row) -> dict:
     return {
         "count": row["count"],
         "mean_seconds": row["mean_seconds"],
@@ -111,6 +108,14 @@ async def resolution_stats(db: AsyncSession, *conditions: Any, join_resolver=Non
         ),
         "on_time_ratio": ratio(row["on_time"], row["count"]),
     }
+
+
+async def resolution_stats(db: AsyncSession, *conditions: Any, join_resolver=None) -> dict:
+    """Count, mean, median resolve seconds and on-time ratio for resolved tickets."""
+    statement = select(*_resolution_columns()).where(Incident.resolved_at.is_not(None), *conditions)
+    if join_resolver is not None:
+        statement = statement.join(join_resolver, join_resolver.c.incident_id == Incident.id)
+    return _stats((await db.execute(statement)).mappings().one())
 
 
 async def company_view(
@@ -235,21 +240,32 @@ async def company_view(
         for row in top_rows
     ]
 
+    # One grouped query for every team (credited to the latest resolver's team).
     resolver = latest_resolver()
+    by_team = {
+        row["team_id"]: row
+        for row in (
+            await db.execute(
+                select(EngineerProfile.team_id, *_resolution_columns())
+                .select_from(Incident)
+                .join(resolver, resolver.c.incident_id == Incident.id)
+                .join(EngineerProfile, EngineerProfile.user_id.cast(String) == resolver.c.resolver)
+                .where(
+                    Incident.resolved_at.is_not(None),
+                    EngineerProfile.team_id.is_not(None),
+                    *where_building,
+                    *resolved_in(start, end),
+                )
+                .group_by(EngineerProfile.team_id)
+            )
+        ).mappings()
+    }
+    empty = {"count": 0, "mean_seconds": None, "median_seconds": None, "on_time": 0}
     teams = (await db.scalars(select(Team).order_by(Team.name, Team.id))).all()
-    time_by_team = []
-    for team in teams:
-        members = select(EngineerProfile.user_id.cast(String)).where(
-            EngineerProfile.team_id == team.id
-        )
-        stats = await resolution_stats(
-            db,
-            *where_building,
-            *resolved_in(start, end),
-            resolver.c.resolver.in_(members),
-            join_resolver=resolver,
-        )
-        time_by_team.append({"team_id": team.id, "name": team.name, **stats})
+    time_by_team = [
+        {"team_id": team.id, "name": team.name, **_stats(by_team.get(team.id, empty))}
+        for team in teams
+    ]
 
     building_rows = (
         await db.execute(

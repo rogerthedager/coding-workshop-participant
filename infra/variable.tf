@@ -83,3 +83,20 @@ variable "aws_eks_type" {
     error_message = "The aws_eks_type variable must be either 'ON_DEMAND' or 'SPOT'."
   }
 }
+
+variable "facility_allowed_origins" {
+  description = "JSON array of exact HTTPS browser origins for facility-service, e.g. [\"https://xxxx.cloudfront.net\"]. Default: empty (not set)."
+  type        = string
+  default     = ""
+}
+
+variable "aws_lambda_memory_mb" {
+  description = "Memory for backend Lambda functions in MB. Lambda CPU scales with memory, so this also sets request speed (bcrypt logins, cold starts). Default: 1024."
+  type        = number
+  default     = 1024
+
+  validation {
+    condition     = var.aws_lambda_memory_mb >= 128 && var.aws_lambda_memory_mb <= 10240
+    error_message = "The aws_lambda_memory_mb variable must be between 128 and 10240."
+  }
+}

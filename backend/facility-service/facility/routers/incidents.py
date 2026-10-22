@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import case, exists, func, literal_column, or_, select, text
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
@@ -64,6 +65,7 @@ from ..permissions import (
     load_incident,
     readable_clause,
     relationship,
+    relationships,
     require_nonfinal,
     require_permission,
     touch,
@@ -203,7 +205,107 @@ async def incident_projection(
 
     Followers get a reduced projection: no description and no creator identity.
     """
-    rel = rel or await relationship(db, user, incident)
+    rels = {incident.id: rel} if rel is not None else None
+    return (await incident_projections(db, [incident], user, rels))[0]
+
+
+DECISION_EVENTS = [IncidentEventType.ESCALATION_APPROVED, IncidentEventType.ESCALATION_REJECTED]
+
+
+async def _latest_escalations(
+    db: AsyncSession, incident_ids: list[UUID]
+) -> dict[UUID, EscalationRequest]:
+    """Each ticket's newest escalation, in one DISTINCT ON query."""
+    rows = await db.scalars(
+        select(EscalationRequest)
+        .where(EscalationRequest.incident_id.in_(incident_ids))
+        .order_by(
+            EscalationRequest.incident_id,
+            EscalationRequest.requested_at.desc(),
+            EscalationRequest.id.desc(),
+        )
+        .ext(distinct_on(EscalationRequest.incident_id))
+    )
+    return {row.incident_id: row for row in rows}
+
+
+async def _decision_notes(
+    db: AsyncSession, decided: list[EscalationRequest]
+) -> tuple[dict[UUID, str], dict[UUID, IncidentNote]]:
+    """The note id each decided escalation points to, and those notes."""
+    if not decided:
+        return {}, {}
+    events = await db.scalars(
+        select(IncidentEvent)
+        .where(
+            IncidentEvent.incident_id.in_({entry.incident_id for entry in decided}),
+            IncidentEvent.type.in_(DECISION_EVENTS),
+            IncidentEvent.payload["escalation_id"].astext.in_([str(e.id) for e in decided]),
+        )
+        .order_by(IncidentEvent.created_at.desc())
+    )
+    wanted = {(entry.incident_id, str(entry.id)): entry.id for entry in decided}
+    note_ids: dict[UUID, str] = {}
+    for item in events:
+        key = (item.incident_id, (item.payload or {}).get("escalation_id"))
+        # Newest first: keep only the latest decision event per escalation.
+        if key in wanted and wanted[key] not in note_ids:
+            note_ids[wanted[key]] = (item.payload or {}).get("note_id")
+    note_ids = {key: value for key, value in note_ids.items() if value}
+    notes: dict[UUID, IncidentNote] = {}
+    if note_ids:
+        found = await db.scalars(
+            select(IncidentNote).where(
+                IncidentNote.id.in_([UUID(value) for value in note_ids.values()])
+            )
+        )
+        notes = {note.id: note for note in found}
+    return note_ids, notes
+
+
+async def incident_projections(
+    db: AsyncSession,
+    incidents: list[Incident],
+    user: User,
+    rels: dict[UUID, Rel] | None = None,
+) -> list[dict[str, Any]]:
+    """Project many tickets with a fixed number of queries, whatever the page size."""
+    if not incidents:
+        return []
+    rels = rels or await relationships(db, user, incidents)
+    latest_by_incident = await _latest_escalations(db, [item.id for item in incidents])
+    decided = [
+        entry
+        for entry in latest_by_incident.values()
+        if entry.state in {EscalationState.APPROVED, EscalationState.REJECTED}
+    ]
+    note_ids, notes = await _decision_notes(db, decided)
+    referenced = {
+        value
+        for item in incidents
+        for value in (
+            item.created_by,
+            item.assigned_to,
+            getattr(latest_by_incident.get(item.id), "requester_id", None),
+        )
+        if value
+    }
+    names = await people_names(db, referenced)
+    return [
+        _project(item, user, rels[item.id], latest_by_incident.get(item.id), note_ids, notes, names)
+        for item in incidents
+    ]
+
+
+def _project(
+    incident: Incident,
+    user: User,
+    rel: Rel,
+    latest: EscalationRequest | None,
+    note_ids: dict[UUID, str],
+    notes: dict[UUID, IncidentNote],
+    names: dict[str, str],
+) -> dict[str, Any]:
     fields = (
         "id",
         "number",
@@ -245,32 +347,18 @@ async def incident_projection(
             if isinstance(value, UUID)
             else (_iso(value) if isinstance(value, datetime) else value)
         )
-    latest = await _latest_escalation(db, incident.id)
     result["latest_escalation"] = _escalation_projection(latest)
-    if latest and latest.state in {EscalationState.APPROVED, EscalationState.REJECTED}:
-        decision = await db.scalar(
-            select(IncidentEvent)
-            .where(
-                IncidentEvent.incident_id == incident.id,
-                IncidentEvent.type.in_(
-                    [IncidentEventType.ESCALATION_APPROVED, IncidentEventType.ESCALATION_REJECTED]
-                ),
-                IncidentEvent.payload["escalation_id"].astext == str(latest.id),
-            )
-            .order_by(IncidentEvent.created_at.desc())
-            .limit(1)
-        )
-        note_id = (decision.payload or {}).get("note_id") if decision else None
-        if note_id:
-            note = await db.get(IncidentNote, UUID(note_id))
-            result["latest_escalation"]["decision_note_id"] = note_id
-            if note is None or note.hidden_at is not None:
-                result["latest_escalation"]["decision_reason"] = None
-                result["latest_escalation"]["action_plan"] = None
-            elif latest.state == EscalationState.REJECTED:
-                result["latest_escalation"]["decision_reason"] = note.body
-            elif latest.action_plan:
-                result["latest_escalation"]["action_plan"] = note.body
+    note_id = note_ids.get(latest.id) if latest else None
+    if note_id:
+        note = notes.get(UUID(note_id))
+        result["latest_escalation"]["decision_note_id"] = note_id
+        if note is None or note.hidden_at is not None:
+            result["latest_escalation"]["decision_reason"] = None
+            result["latest_escalation"]["action_plan"] = None
+        elif latest.state == EscalationState.REJECTED:
+            result["latest_escalation"]["decision_reason"] = note.body
+        elif latest.action_plan:
+            result["latest_escalation"]["action_plan"] = note.body
     state = sla_state(incident)
     result["sla_state"] = state.value if state else None
     result["permissions"] = {
@@ -282,11 +370,16 @@ async def incident_projection(
         "team_lead": rel.team_lead,
     }
     result["following"] = rel.follower
-    result["people"] = await people_names(
-        db,
-        [incident.created_by, incident.assigned_to, latest.requester_id if latest else None],
-        hide=hidden_identity(incident, rel),
-    )
+    hide = hidden_identity(incident, rel)
+    result["people"] = {
+        str(value): names[str(value)]
+        for value in (
+            incident.created_by,
+            incident.assigned_to,
+            latest.requester_id if latest else None,
+        )
+        if value and value != hide and str(value) in names
+    }
     if rel.follower_only:
         for key in FOLLOWER_HIDDEN:
             result.pop(key, None)
@@ -392,6 +485,26 @@ async def _active_engineer(db: AsyncSession, user_id: UUID) -> EngineerProfile:
 def masked_id(user_id: UUID | None, hidden: UUID | None) -> str | None:
     """Return a user ID unless it is the identity hidden from this reader."""
     return None if user_id is None or user_id == hidden else str(user_id)
+
+
+def search_clause(q: str):
+    """Ticket-number or full-text match that both use an index.
+
+    Every branch must be indexable, or PostgreSQL scans the whole table for the OR.
+    The text expression must match ix_incidents_search exactly, so the separator
+    is a SQL literal rather than a bound parameter.
+    """
+    document = func.to_tsvector(
+        literal_column("'english'"),
+        Incident.title.op("||")(literal_column("' '")).op("||")(Incident.description),
+    )
+    matches = document.op("@@")(func.plainto_tsquery(literal_column("'english'"), q))
+    # INC-000123, inc-123 and 123 all find ticket INC-000123. Numbers are always
+    # INC-%06d, so this also covers any case-insensitive exact number.
+    numeric = re.fullmatch(r"(?:inc-?)?0*(\d{1,12})", q.strip(), re.IGNORECASE)
+    if numeric is None:
+        return matches
+    return or_(Incident.number == f"INC-{int(numeric.group(1)):06d}", matches)
 
 
 def hidden_identity(incident: Incident, rel: Rel) -> UUID | None:
@@ -631,20 +744,7 @@ async def list_incidents(
         require_permission(is_admin(user) or UserRole.ENGINEER in (user.roles or []))
         conditions.append(Incident.assigned_to == user.id)
     if q:
-        document = func.to_tsvector(
-            literal_column("'english'"),
-            Incident.title + " " + Incident.description,
-        )
-        # INC-000123, inc-123 and 123 all find ticket INC-000123.
-        numeric = re.fullmatch(r"(?:inc-?)?0*(\d{1,12})", q.strip(), re.IGNORECASE)
-        number = f"INC-{int(numeric.group(1)):06d}" if numeric else None
-        conditions.append(
-            or_(
-                Incident.number == number,
-                func.upper(Incident.number) == q.strip().upper(),
-                document.op("@@")(func.plainto_tsquery(literal_column("'english'"), q)),
-            )
-        )
+        conditions.append(search_clause(q))
     if status:
         conditions.append(Incident.status.in_(status))
     if priority:
@@ -774,7 +874,7 @@ async def list_incidents(
         )
     ).all()
     return {
-        "items": [await incident_projection(db, item, user) for item in incidents],
+        "items": await incident_projections(db, list(incidents), user),
         "total": total,
         "page": page,
         "page_size": page_size,
