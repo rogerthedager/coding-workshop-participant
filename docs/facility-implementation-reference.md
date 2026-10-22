@@ -1430,7 +1430,8 @@ Workflow and routing code also locks the rows it changes with `SELECT … FOR UP
 | 0002 | `0002_shared_domain_enums.py` | Adds CHECKs for user roles, blocked_reason and event types. Bad existing data stops the upgrade instead of being rewritten. |
 | 0003 | `0003_engineer_skills.py` | Adds `engineer_profiles.skills` (JSONB) and its 3 checks. |
 | 0004 | `0004_optional_incident_floor.py` | Makes `incidents.floor_id` optional and adds the rule that a seat needs a floor. |
-| 0005 (head) | `0005_teams_routing_sla_notifications.py` | Adds the `lead` role and the `attachment_added` event type. Creates teams, category_groups, incident_followers, notifications and attachments. Adds team, home-building and group columns, plus the incident routing, SLA and duplicate columns. Fills in due times and `close_kind` for existing rows, adds the partial indexes and the new checks. |
+| 0005 | `0005_teams_routing_sla_notifications.py` | Adds the `lead` role and the `attachment_added` event type. Creates teams, category_groups, incident_followers, notifications and attachments. Adds team, home-building and group columns, plus the incident routing, SLA and duplicate columns. Fills in due times and `close_kind` for existing rows, adds the partial indexes and the new checks. |
+| 0006 (head) | `0006_query_performance_indexes.py` | Adds indexes for report metrics (`incident_events` by type and date, latest resolution), the latest public note, engineer workload (`assigned_to, status`), the SLA alert job (partial indexes on active due times) and the latest escalation. Drops `ix_incidents_assigned_to` and `ix_escalation_requests_incident_id`, which the new composite indexes cover. |
 
 **How migrations run:**
 - **Locally:**

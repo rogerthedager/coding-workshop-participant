@@ -38,3 +38,20 @@ export function cohortQuery(days, buildingId) {
   const from = new Date(to.getTime() - Number(days) * 86400000);
   return { from: from.toISOString(), to: to.toISOString(), building_id: buildingId || undefined };
 }
+
+const NAME_CHARS = /^[\p{L}\p{M} .'’-]+$/u;
+const LETTER = /[\p{L}\p{M}]/gu;
+
+/**
+ * Why a person's name is not acceptable, or '' when it is. Mirrors the API rule
+ * (validate_full_name): letters in any language plus spaces, hyphens, apostrophes
+ * and periods; no digits or symbols; starts with a letter; at least 2 letters.
+ */
+export function nameProblem(value) {
+  const name = value.trim().replace(/\s+/g, ' ');
+  if (!name) return 'Enter your full name.';
+  if (!NAME_CHARS.test(name)) return 'Use letters only. Spaces, hyphens (-), apostrophes (\') and periods are fine.';
+  if (!/^\p{L}/u.test(name)) return 'Start your name with a letter.';
+  if ((name.match(LETTER) || []).length < 2) return 'Enter at least 2 letters.';
+  return '';
+}

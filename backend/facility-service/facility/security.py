@@ -4,6 +4,7 @@ import functools
 import hashlib
 import re
 import secrets
+import unicodedata
 from datetime import timedelta
 from uuid import UUID
 
@@ -27,6 +28,35 @@ def validate_password(password: str) -> str:
             "Password needs 10+ characters, a letter and digit, and at most 72 UTF-8 bytes"
         )
     return password
+
+
+NAME_PUNCTUATION = frozenset(" -'’.")
+NAME_RULE = (
+    "Enter your real name using letters only "
+    "(spaces, hyphens, apostrophes and periods are allowed)"
+)
+
+
+def _is_letter(char: str) -> bool:
+    # Letters in any script, plus combining marks such as accents.
+    return unicodedata.category(char)[0] in {"L", "M"}
+
+
+def validate_full_name(value: str) -> str:
+    """A person's display name: letters in any language, no digits or symbols.
+
+    Extra spaces are collapsed, so "  Mary   Jane " is stored as "Mary Jane".
+    """
+    name = " ".join(value.split())
+    if not name:
+        raise ValueError("Full name is required")
+    if not all(_is_letter(char) or char in NAME_PUNCTUATION for char in name):
+        raise ValueError(NAME_RULE)
+    if not unicodedata.category(name[0]).startswith("L"):
+        raise ValueError("Name must start with a letter")
+    if sum(_is_letter(char) for char in name) < 2:
+        raise ValueError("Name must have at least 2 letters")
+    return name
 
 
 def normalize_email(email: str) -> str:

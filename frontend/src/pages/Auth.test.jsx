@@ -153,3 +153,39 @@ describe('accessibility', () => {
     expect(await axe(container, options)).toHaveNoViolations();
   });
 });
+
+describe('sign up name', () => {
+  const signedOut = () => http.post(`${API}/auth/refresh`, () => apiError(401, 'unauthenticated', 'No session.'));
+
+  async function fill(user, name) {
+    await user.type(await screen.findByLabelText('Full name'), name);
+    await user.type(screen.getByLabelText('Work email'), 'new.person@acme.inc');
+    await user.type(screen.getByLabelText('Password'), 'Valid-Passphrase-734!');
+    await user.type(screen.getByLabelText('Confirm password'), 'Valid-Passphrase-734!');
+    await user.click(screen.getByRole('button', { name: 'Create account' }));
+  }
+
+  it.each(['12345', 'John123', 'user_1'])('refuses "%s" before calling the API', async (name) => {
+    const calls = [];
+    server.use(signedOut(), http.post(`${API}/auth/register`, async ({ request }) => {
+      calls.push(await request.json());
+      return HttpResponse.json(employee, { status: 201 });
+    }));
+    const { user } = renderApp('/register');
+    await fill(user, name);
+    expect(await screen.findByText(/Use letters only/)).toBeInTheDocument();
+    expect(calls).toHaveLength(0);
+  });
+
+  it('accepts a real name and sends it with tidy spacing', async () => {
+    const calls = [];
+    server.use(signedOut(), http.post(`${API}/auth/register`, async ({ request }) => {
+      calls.push(await request.json());
+      return HttpResponse.json(employee, { status: 201 });
+    }));
+    const { user } = renderApp('/register');
+    await fill(user, "  Anne-Marie   O'Neil ");
+    expect(await screen.findByText('Account created')).toBeInTheDocument();
+    expect(calls[0].full_name).toBe("Anne-Marie O'Neil");
+  });
+});

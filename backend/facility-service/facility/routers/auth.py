@@ -23,6 +23,7 @@ from facility.security import (
     new_refresh_token,
     normalize_email,
     signing_secret,
+    validate_full_name,
     validate_password,
     verify_password,
 )
@@ -48,13 +49,7 @@ class Registration(StrictModel):
     _email = field_validator("email")(normalize_email)
     _password = field_validator("password")(validate_password)
 
-    @field_validator("full_name")
-    @classmethod
-    def nonblank_name(cls, value: str) -> str:
-        """Store a nonempty display name."""
-        if not value.strip():
-            raise ValueError("Full name is required")
-        return value.strip()
+    _full_name = field_validator("full_name")(validate_full_name)
 
 
 class Login(StrictModel):

@@ -3,11 +3,16 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { useDirectory } from '../directory';
-import { useLoad } from '../hooks';
+import { useClientPage, useLoad } from '../hooks';
 import { Availability, ErrorBox, Loading, Priority, StatusChip } from '../components/ui';
 import { assignWithConfirm, byUrgency } from '../lib';
+import { Pager } from './MyTickets';
 
 const ACTIVE = ['Open', 'In Progress', 'Blocked', 'Resolved'];
+/** Items per page in each list. */
+export const QUEUE_PAGE_SIZE = 10;
+export const TEAM_PAGE_SIZE = 20;
+const FOOT = { borderTop: '1px solid var(--line-2)' };
 
 /** Admin workload board: balance load, hand out unassigned tickets, clear blockers. */
 export default function Team() {
@@ -23,6 +28,13 @@ export default function Team() {
   const blocked = assigned.filter((t) => t.status === 'Blocked');
   const rows = assigned.filter((t) => !focus || t.assigned_to === focus);
   const maxLoad = Math.max(5, ...engineers.map((e) => e.workload));
+  const unassignedPage = useClientPage(unassigned, QUEUE_PAGE_SIZE);
+  const blockedPage = useClientPage(blocked, QUEUE_PAGE_SIZE);
+  const rowsPage = useClientPage(rows, TEAM_PAGE_SIZE);
+  const focusOn = (userId) => {
+    setFocus(userId);
+    rowsPage.reset();
+  };
 
   const assign = async (incident, userId) => {
     if (!userId) return;
@@ -55,7 +67,7 @@ export default function Team() {
           const on = focus === e.user_id;
           return (
             <button key={e.id} type="button" className={`eng${on ? ' on' : ''}`} aria-pressed={on}
-              onClick={() => setFocus(on ? null : e.user_id)}>
+              onClick={() => focusOn(on ? null : e.user_id)}>
               <span className="split" style={{ width: '100%', alignItems: 'center' }}>
                 <span style={{ fontSize: 15, fontWeight: 500 }}>{e.user.full_name}</span>
                 <Availability value={e.availability} />
@@ -83,7 +95,7 @@ export default function Team() {
             <span className="small muted">{unassigned.length} {unassigned.length === 1 ? 'ticket' : 'tickets'}</span>
           </div>
           {tickets.loading && !tickets.data && <Loading />}
-          {unassigned.map((t) => (
+          {unassignedPage.shown.map((t) => (
             <div className="list-row" key={t.id}>
               <div className="main">
                 <div style={{ fontSize: 14, fontWeight: 500 }}>{t.title}</div>
@@ -102,11 +114,12 @@ export default function Team() {
           {tickets.data && unassigned.length === 0 && (
             <div className="empty" style={{ borderTop: '1px solid var(--line-2)' }}>Every open ticket has an engineer.</div>
           )}
+          {unassignedPage.pages > 1 && <div style={FOOT}><Pager {...unassignedPage.pagerProps} /></div>}
         </section>
 
         <section className="card" aria-labelledby="blk-h">
           <div className="card-head" style={{ paddingBottom: 8 }}><h2 id="blk-h">Blocked</h2></div>
-          {blocked.map((t) => (
+          {blockedPage.shown.map((t) => (
             <div className="list-row" key={t.id}>
               <div className="main">
                 <div style={{ fontSize: 14, fontWeight: 500 }}>{t.title}</div>
@@ -119,19 +132,20 @@ export default function Team() {
             </div>
           ))}
           {tickets.data && blocked.length === 0 && <div className="empty" style={{ borderTop: '1px solid var(--line-2)' }}>Nothing is blocked.</div>}
+          {blockedPage.pages > 1 && <div style={FOOT}><Pager {...blockedPage.pagerProps} /></div>}
         </section>
       </div>
 
       <section className="card" aria-labelledby="tt-h">
         <div className="card-head" style={{ paddingBottom: 8 }}>
           <h2 id="tt-h">{focus ? `${dir.person(focus)}’s tickets` : 'All team tickets'}</h2>
-          {focus && <button type="button" className="btn sm" onClick={() => setFocus(null)}>Show whole team</button>}
+          {focus && <button type="button" className="btn sm" onClick={() => focusOn(null)}>Show whole team</button>}
         </div>
         <div className="scroll">
           <table>
             <thead><tr><th>Number</th><th>Title</th><th>Engineer</th><th>Status</th><th>Priority</th><th>Age</th></tr></thead>
             <tbody>
-              {rows.map((t) => (
+              {rowsPage.shown.map((t) => (
                 <tr key={t.id}>
                   <td><Link className="mono" to={`/incidents/${t.id}`}>{t.number}</Link></td>
                   <td className="t-title">{t.title}</td>
@@ -145,6 +159,7 @@ export default function Team() {
           </table>
         </div>
         {tickets.data && rows.length === 0 && <div className="empty">No active tickets.</div>}
+        {rowsPage.pages > 1 && <div style={FOOT}><Pager {...rowsPage.pagerProps} /></div>}
       </section>
     </>
   );

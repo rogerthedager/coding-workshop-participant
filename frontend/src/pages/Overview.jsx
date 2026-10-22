@@ -3,12 +3,15 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api';
 import { useDirectory } from '../directory';
-import { useLoad } from '../hooks';
+import { useClientPage, useLoad } from '../hooks';
 import { ErrorBox, Loading } from '../components/ui';
 import { cohortQuery } from '../lib';
+import { Pager } from './MyTickets';
 
 const PERIODS = [['7', 'Last 7 days'], ['30', 'Last 30 days'], ['90', 'Last 90 days']];
 const DAY = 86400000;
+/** "Needs a decision" shows this many items at a time. */
+export const ATTENTION_PAGE_SIZE = 10;
 
 /** Count of tickets reported in each week of the period (one list call per week). */
 async function weeklyReported(days, buildingId) {
@@ -37,7 +40,7 @@ export default function Overview() {
     const [dashboard, reported, critical, weeks] = await Promise.all([
       api.adminDashboard(query),
       api.incidents({ date_from: query.from, date_to: query.to, building_id: query.building_id, page_size: 1 }),
-      api.incidents({ priority: 'Critical', status: ['Open', 'In Progress', 'Blocked'], building_id: query.building_id, page_size: 10 }),
+      api.incidents({ priority: 'Critical', status: ['Open', 'In Progress', 'Blocked'], building_id: query.building_id, page_size: 100 }),
       weeklyReported(days, building),
     ]);
     const longBlocked = dashboard.blocked.filter((b) => Date.now() - new Date(b.blocked_since).getTime() > 2 * DAY);
@@ -45,6 +48,14 @@ export default function Overview() {
   }, [days, building]);
 
   const data = load.data;
+  // Built before the early returns below, because the paging hook must run on every render.
+  const attention = data ? [
+    ...data.critical.map((t) => ({ kind: 'Critical', cls: 'c-crit', id: t.id, text: `${t.number} · ${t.title}`, age: `Open ${age(t.created_at)}` })),
+    ...data.dashboard.pending_escalations.map((e) => ({ kind: 'Escalation', cls: 'c-esc', id: e.id, text: e.number, age: `Waiting ${age(e.requested_at)}` })),
+    ...data.longBlocked.map((b) => ({ kind: 'Blocked', cls: 'c-blk', id: b.id, text: `${b.number} · ${b.blocked_reason}`, age: `Blocked ${age(b.blocked_since)}` })),
+  ] : [];
+  const attentionPage = useClientPage(attention, ATTENTION_PAGE_SIZE);
+  const resetAttention = attentionPage.reset;
   const head = (
     <div className="page-head">
       <div>
@@ -53,13 +64,13 @@ export default function Overview() {
       </div>
       <div className="actions" style={{ alignItems: 'center' }}>
         <label className="sr-only" htmlFor="ov-bld">Building</label>
-        <select id="ov-bld" className="sel" value={building} onChange={(e) => setBuilding(e.target.value)}>
+        <select id="ov-bld" className="sel" value={building} onChange={(e) => { setBuilding(e.target.value); resetAttention(); }}>
           <option value="">All buildings</option>
           {dir.buildings.map((b) => <option key={b.id} value={b.id}>{b.name}</option>)}
         </select>
         <div className="pill-group" role="group" aria-label="Period">
           {PERIODS.map(([value, label]) => (
-            <button key={value} type="button" className={days === value ? 'on' : ''} aria-pressed={days === value} onClick={() => setDays(value)}>{label}</button>
+            <button key={value} type="button" className={days === value ? 'on' : ''} aria-pressed={days === value} onClick={() => { setDays(value); resetAttention(); }}>{label}</button>
           ))}
         </div>
       </div>
@@ -71,11 +82,6 @@ export default function Overview() {
   const d = data.dashboard;
   const resolved = d.lifecycle.resolved;
   const maxWeek = Math.max(1, ...data.weeks.map((w) => w.count));
-  const attention = [
-    ...data.critical.map((t) => ({ kind: 'Critical', cls: 'c-crit', id: t.id, text: `${t.number} · ${t.title}`, age: `Open ${age(t.created_at)}` })),
-    ...d.pending_escalations.map((e) => ({ kind: 'Escalation', cls: 'c-esc', id: e.id, text: e.number, age: `Waiting ${age(e.requested_at)}` })),
-    ...data.longBlocked.map((b) => ({ kind: 'Blocked', cls: 'c-blk', id: b.id, text: `${b.number} · ${b.blocked_reason}`, age: `Blocked ${age(b.blocked_since)}` })),
-  ];
   const kpis = [
     ['Incidents reported', data.reported, 'Created in the selected period'],
     ['Resolved', resolved.sample_count, data.reported ? `${Math.round((resolved.sample_count / data.reported) * 100)}% of reported` : ''],
@@ -116,7 +122,7 @@ export default function Overview() {
         <section className="card pad" aria-labelledby="attn-h">
           <h2 id="attn-h">Needs a decision</h2>
           <p className="small muted" style={{ margin: '4px 0 8px' }}>Critical tickets, escalations waiting on an admin, and tickets blocked longer than 2 days.</p>
-          {attention.map((a) => (
+          {attentionPage.shown.map((a) => (
             <div key={`${a.kind}-${a.id}`} className="actions" style={{ alignItems: 'center', padding: '10px 0', borderTop: '1px solid var(--line-2)', gap: 12 }}>
               <span className={`chip ${a.cls}`}>{a.kind}</span>
               <Link to={`/incidents/${a.id}`} style={{ flex: '1 1 200px', fontSize: 14 }}>{a.text}</Link>
@@ -124,6 +130,14 @@ export default function Overview() {
             </div>
           ))}
           {attention.length === 0 && <p className="small muted">Nothing needs a decision right now.</p>}
+          {attentionPage.pages > 1 && (
+            <div style={{ borderTop: '1px solid var(--line-2)', marginBottom: -12 }}>
+              {/* Cancel the footer's side padding so it lines up with the rows. */}
+              <div style={{ margin: '0 -16px' }}>
+                <Pager {...attentionPage.pagerProps} />
+              </div>
+            </div>
+          )}
         </section>
       </div>
 

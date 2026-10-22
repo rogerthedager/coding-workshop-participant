@@ -97,6 +97,12 @@ resource "aws_cloudfront_distribution" "this" {
     target_origin_id       = local.origin_id
     viewer_protocol_policy = "redirect-to-https"
 
+    # Serve index.html for client-side routes (e.g. /overview) so deep links and refreshes work.
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = element(aws_cloudfront_function.spa_routes.*.arn, count.index)
+    }
+
     forwarded_values {
       query_string = false
 
@@ -146,4 +152,25 @@ resource "aws_s3_bucket_policy" "this" {
       }
     ]
   })
+}
+
+# The website bucket is private, so S3 answers 403 (not 404) for app routes like /overview.
+# Rewrite any path without a file extension to the SPA entry point; files and the API
+# behaviours (/api/...) are untouched, so real API errors are not masked.
+resource "aws_cloudfront_function" "spa_routes" {
+  count   = data.aws_caller_identity.this.id != "000000000000" ? 1 : 0
+  name    = format("%s-spa-routes-%s", var.aws_project, local.app_id)
+  runtime = "cloudfront-js-2.0"
+  comment = "Serve index.html for client-side routes"
+  publish = true
+  code    = <<-JS
+    function handler(event) {
+      var request = event.request;
+      var last = request.uri.split('/').pop();
+      if (request.uri.indexOf('/api/') !== 0 && last.indexOf('.') === -1) {
+        request.uri = '/index.html';
+      }
+      return request;
+    }
+  JS
 }

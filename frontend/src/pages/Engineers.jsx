@@ -3,6 +3,7 @@ import { api } from '../api';
 import { useDirectory } from '../directory';
 import { useLoad } from '../hooks';
 import { Availability } from '../components/ui';
+import { nameProblem } from '../lib';
 
 const SKILLS = [
   'IT and AV equipment', 'Network and Wi-Fi', 'Furniture', 'HVAC and temperature',
@@ -85,6 +86,11 @@ export default function Engineers() {
   const create = async (event) => {
     event.preventDefault();
     if (busy) return;
+    const badName = nameProblem(form.full_name);
+    if (badName) {
+      setError({ detail: `Full name: ${badName}` });
+      return;
+    }
     setError(null);
     setBusy(true);
     try {

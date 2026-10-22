@@ -44,3 +44,20 @@ export function useLoad(load, deps) {
     reload: () => setTick((t) => t + 1),
   };
 }
+
+/**
+ * Page through a list that is already in memory, `size` items at a time.
+ * `pagerProps` feed <Pager>; show it only when `pages > 1`. The page is clamped,
+ * so a list that shrinks (e.g. after an assignment) never lands on an empty page.
+ */
+export function useClientPage(items, size) {
+  const [page, setPage] = useState(1);
+  const pages = Math.max(1, Math.ceil(items.length / size));
+  const current = Math.min(page, pages);
+  return {
+    shown: items.slice((current - 1) * size, current * size),
+    pages,
+    reset: () => setPage(1),
+    pagerProps: { data: { total: items.length, page_size: size }, page: current, pages, setPage },
+  };
+}

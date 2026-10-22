@@ -3,6 +3,7 @@ import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { useAuth } from '../auth';
 import { Icon } from '../components/ui';
+import { nameProblem } from '../lib';
 
 const ACME_EMAIL = /^[^@\s]+@acme\.inc$/i;
 const ANY_EMAIL = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
@@ -17,7 +18,7 @@ const PREVIEW_ACCOUNTS = [
 function AuthAside({ title, children, footer }) {
   return (
     <aside className="auth-aside">
-      <div className="brand" style={{ color: '#fff' }}><span className="mark">A</span>ACME Incidents</div>
+      <div className="brand" style={{ color: 'var(--aside-ink)' }}><span className="mark">A</span>ACME Incidents</div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 460 }}>
         <h1>{title}</h1>
         {children}
@@ -165,17 +166,17 @@ export function Register() {
 
   const email = form.email.trim();
   const passOk = passwordChecks(form.password).every(([, ok]) => ok);
-  const nameErr = tried && form.name.trim().length < 2 ? 'Enter your full name.' : '';
+  const nameErr = tried ? nameProblem(form.name) : '';
   const emailErr = !tried ? '' : !email ? 'Enter your work email.' : ACME_EMAIL.test(email) ? '' : 'Use your @acme.inc work email.';
   const confirmErr = tried && form.confirm !== form.password ? 'Passwords don’t match.' : '';
 
   const submit = async (event) => {
     event.preventDefault();
     setTried(true);
-    if (form.name.trim().length < 2 || !ACME_EMAIL.test(email) || !passOk || form.confirm !== form.password) return;
+    if (nameProblem(form.name) || !ACME_EMAIL.test(email) || !passOk || form.confirm !== form.password) return;
     setBusy(true);
     try {
-      await api.register({ full_name: form.name.trim(), email, password: form.password });
+      await api.register({ full_name: form.name.trim().replace(/\s+/g, ' '), email, password: form.password });
       setDone(true);
     } catch (error) {
       setServerError(error);
@@ -187,7 +188,7 @@ export function Register() {
   return (
     <div className="auth">
       <AuthAside title="Your account is for reporting and tracking." footer="Only @acme.inc addresses can register.">
-        <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: 'var(--ctl)' }}>
+        <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: 'var(--aside-text)' }}>
           Everyone starts as an employee and can report incidents and follow their own tickets.
           Facilities admins grant engineer or admin access.
         </p>
@@ -276,7 +277,7 @@ export function ChangePassword() {
   return (
     <div className="auth">
       <AuthAside title="Choose your own password." footer={`Signed in as ${user.email}`}>
-        <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: 'var(--ctl)' }}>
+        <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, color: 'var(--aside-text)' }}>
           {user.must_change_password
             ? 'Your account was created with a temporary password. Replace it before you continue.'
             : 'Changing your password signs out your other sessions.'}

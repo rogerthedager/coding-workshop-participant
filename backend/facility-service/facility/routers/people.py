@@ -33,7 +33,12 @@ from facility.models import (
     validate_skill_list,
 )
 from facility.routers.auth import StrictModel, revoke_sessions, user_output
-from facility.security import hash_password, normalize_email, validate_password
+from facility.security import (
+    hash_password,
+    normalize_email,
+    validate_full_name,
+    validate_password,
+)
 
 router = APIRouter(tags=["Users and engineers"])
 Db = Annotated[AsyncSession, Depends(get_db)]
@@ -49,10 +54,8 @@ class SelfUpdate(StrictModel):
     @field_validator("full_name")
     @classmethod
     def valid_name(cls, value: str) -> str:
-        """Reject whitespace-only names."""
-        if not value.strip():
-            raise ValueError("Full name is required")
-        return value.strip()
+        """A real name: letters, spaces, hyphens, apostrophes and periods."""
+        return validate_full_name(value)
 
 
 class MeUpdate(StrictModel):
