@@ -160,3 +160,26 @@ async def test_dashboards_count_only_their_persona_scope(
     ]:
         response = await client.get(f"/api/v1/dashboard/{target}", headers=await auth_headers(role))
         assert response.status_code == expected
+
+
+async def test_hotspots_report_each_locations_top_category(
+    client, db, admin, auth_headers, make_incident, reference_data
+):
+    """Overview's "Top category" is the most-reported category, even below the recurring bar."""
+    from facility.models import Category
+
+    other = Category(name="Plumbing", is_active=True, sort_order=1)
+    db.add(other)
+    await db.commit()
+    for category in [other, other, reference_data["category"]]:
+        # Seat-level tickets still count towards their floor.
+        await make_incident(category_id=category.id)
+    result = await client.get("/api/v1/dashboard/admin", headers=await auth_headers(admin))
+    assert result.status_code == 200, result.text
+    floor = next(
+        f for f in result.json()["hotspots"]["floors"] if f["id"] == str(reference_data["floor"].id)
+    )
+    assert floor["top_category_id"] == str(other.id)
+    assert floor["top_category_count"] == 2
+    building = result.json()["hotspots"]["buildings"][0]
+    assert building["top_category_id"] == str(other.id)

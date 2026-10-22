@@ -378,9 +378,26 @@ async def admin_dashboard(
             .mappings()
             .all()
         )
+        # Most-reported category per location in the same period (ties: lowest category id).
+        top: dict = {}
+        if rows:
+            ranked = await db.execute(
+                select(column.label("id"), Incident.category_id, func.count().label("count"))
+                .where(*cohort, column.in_([row.id for row in rows]))
+                .group_by(column, Incident.category_id)
+                .order_by(column, func.count().desc(), Incident.category_id)
+            )
+            for entry in ranked.mappings():
+                top.setdefault(entry["id"], entry)
         filter_name = {"buildings": "building_id", "floors": "floor_id", "seats": "seat_id"}[label]
         hotspots[label] = [
-            {**dict(row), "href": link(**{**filters, filter_name: row.id})} for row in rows
+            {
+                **dict(row),
+                "top_category_id": top[row.id]["category_id"] if row.id in top else None,
+                "top_category_count": top[row.id]["count"] if row.id in top else 0,
+                "href": link(**{**filters, filter_name: row.id}),
+            }
+            for row in rows
         ]
     exact_location = case(
         (Incident.seat_id.is_not(None), Incident.seat_id),

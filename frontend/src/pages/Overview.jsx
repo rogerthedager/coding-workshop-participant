@@ -76,7 +76,6 @@ export default function Overview() {
     ...d.pending_escalations.map((e) => ({ kind: 'Escalation', cls: 'c-esc', id: e.id, text: e.number, age: `Waiting ${age(e.requested_at)}` })),
     ...data.longBlocked.map((b) => ({ kind: 'Blocked', cls: 'c-blk', id: b.id, text: `${b.number} · ${b.blocked_reason}`, age: `Blocked ${age(b.blocked_since)}` })),
   ];
-  const recurringFloors = new Set(d.recurring.map((r) => r.location_id));
   const kpis = [
     ['Incidents reported', data.reported, 'Created in the selected period'],
     ['Resolved', resolved.sample_count, data.reported ? `${Math.round((resolved.sample_count / data.reported) * 100)}% of reported` : ''],
@@ -139,15 +138,18 @@ export default function Overview() {
             <tbody>
               {d.hotspots.floors.map((floor) => {
                 const owner = dir.buildings.find((b) => b.floors.some((f) => f.id === floor.id));
-                const top = d.recurring.find((r) => r.location_id === floor.id);
+                const seatIds = new Set(owner?.floors.find((f) => f.id === floor.id)?.seats?.map((s) => s.id) || []);
+                const recurring = d.recurring.some((r) => r.location_id === floor.id || seatIds.has(r.location_id));
                 return (
                   <tr key={floor.id}>
                     <td style={{ fontWeight: 500 }} className="nowrap">
                       {owner ? `${owner.name} · ` : ''}{floor.name}
-                      {recurringFloors.has(floor.id) && <span className="chip c-esc" style={{ marginLeft: 6 }}>Recurring</span>}
+                      {recurring && <span className="chip c-esc" style={{ marginLeft: 6 }}>Recurring</span>}
                     </td>
                     <td className="n">{floor.count}</td>
-                    <td className="muted nowrap">{top ? dir.category(top.category_id) : ''}</td>
+                    <td className="muted nowrap">
+                      {floor.top_category_id ? `${dir.category(floor.top_category_id)} (${floor.top_category_count})` : ''}
+                    </td>
                   </tr>
                 );
               })}
