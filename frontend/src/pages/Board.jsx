@@ -27,6 +27,11 @@ const MOVES = [
 
 const NEEDS_FORM = new Set(['block', 'resolve', 'reject']);
 
+/** Cards shown per column before "Show more"; long columns stay scannable. */
+export const COLUMN_LIMIT = 15;
+
+const slug = (value) => value.replace(/\s+/g, '-').toLowerCase();
+
 /** Moves this caller may make on this ticket right now. */
 function allowedMoves(incident, showFinal) {
   const perm = incident.permissions || {};
@@ -64,7 +69,7 @@ function Card({ incident, moves, dir, selfName, onMove, onDragStart, onDragEnd, 
   const selectId = `move-${incident.id}`;
   return (
     <li
-      className={`card board-card${dragging ? ' dragging' : ''}`}
+      className={`card board-card pri-${slug(incident.priority || '')}${dragging ? ' dragging' : ''}`}
       draggable={!readOnly && moves.length > 0}
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = 'move';
@@ -170,6 +175,8 @@ export default function Board() {
   const [tab, setTab] = useState('Open');
   const [dragged, setDragged] = useState(null);
   const [over, setOver] = useState(null);
+  // Cards shown per column, by status; unset means COLUMN_LIMIT.
+  const [shown, setShown] = useState({});
   const [pending, setPending] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -258,12 +265,15 @@ export default function Board() {
     const readOnly = FINAL.includes(column);
     const allowed = dragTargets.includes(column);
     const dimmed = dragged && !allowed && column !== dragged.status;
-    const headingId = `col-${column.replace(/\s+/g, '-').toLowerCase()}`;
+    const headingId = `col-${slug(column)}`;
+    const limit = shown[column] || COLUMN_LIMIT;
+    const visible = list.slice(0, limit);
+    const hidden = list.length - visible.length;
     return (
       <section
         key={column}
         aria-labelledby={headingId}
-        className={`board-col${readOnly ? ' readonly' : ''}${dimmed ? ' dim' : ''}${allowed ? ' target' : ''}${over === column && allowed ? ' over' : ''}`}
+        className={`board-col col-${slug(column)}${readOnly ? ' readonly' : ''}${dimmed ? ' dim' : ''}${allowed ? ' target' : ''}${over === column && allowed ? ' over' : ''}`}
         onDragOver={(e) => {
           if (!allowed) return;
           e.preventDefault();
@@ -279,6 +289,7 @@ export default function Board() {
         }}
       >
         <h2 id={headingId} className="board-col-head">
+          <span className="board-dot" aria-hidden="true" />
           {statusLabel(column)} <span className="board-count">{list.length}</span>
           {readOnly && <span className="tiny muted"> · read-only</span>}
         </h2>
@@ -286,7 +297,7 @@ export default function Board() {
           <p className="board-empty">No tickets</p>
         ) : (
           <ul className="board-list">
-            {list.map((incident) => (
+            {visible.map((incident) => (
               <Card
                 key={incident.id}
                 incident={incident}
@@ -303,6 +314,22 @@ export default function Board() {
               />
             ))}
           </ul>
+        )}
+        {(hidden > 0 || limit > COLUMN_LIMIT) && (
+          <div className="board-more">
+            {hidden > 0 && (
+              <button type="button" className="btn sm" onClick={() => setShown({ ...shown, [column]: limit + COLUMN_LIMIT })}>
+                Show {Math.min(hidden, COLUMN_LIMIT)} more{' '}
+                <span className="sr-only">in {statusLabel(column)}</span>
+              </button>
+            )}
+            {limit > COLUMN_LIMIT && (
+              <button type="button" className="linkbtn" onClick={() => setShown({ ...shown, [column]: COLUMN_LIMIT })}>
+                Show less{' '}<span className="sr-only">in {statusLabel(column)}</span>
+              </button>
+            )}
+            <span className="tiny muted">Showing {visible.length} of {list.length}</span>
+          </div>
         )}
       </section>
     );

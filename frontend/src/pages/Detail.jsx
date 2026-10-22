@@ -598,7 +598,7 @@ export default function Detail() {
           <div className="blockbar">
             <Icon name="stop" size={18} />
             <strong>Blocked · {incident.blocked_reason}</strong>
-            <span style={{ color: '#7a1a12' }}>since {dateTime(incident.blocked_since)} ({age(incident.blocked_since)})</span>
+            <span style={{ color: 'var(--blocked-ink)' }}>since {dateTime(incident.blocked_since)} ({age(incident.blocked_since)})</span>
           </div>
         )}
       </section>
@@ -606,9 +606,9 @@ export default function Detail() {
       {esc && (pending || esc.decided_at) && (
         <section className="card pad banner warn" style={{ display: 'block' }}>
           <div className="actions" style={{ alignItems: 'flex-start', gap: 12 }}>
-            <span style={{ color: '#8a4b00' }}><Icon name="up" size={22} /></span>
+            <span style={{ color: 'var(--warn-ink)' }}><Icon name="up" size={22} /></span>
             <div style={{ flex: '1 1 360px' }}>
-              <h2 style={{ color: '#6b3a00' }}>
+              <h2 style={{ color: 'var(--warn-ink-2)' }}>
                 {pending
                   ? `Escalation requested by ${person(esc.requester_id)} · ${age(esc.requested_at)} ago`
                   : `Escalation ${esc.state.toLowerCase()} · requested by ${person(esc.requester_id)} ${age(esc.requested_at)} ago`}
@@ -623,7 +623,7 @@ export default function Detail() {
             </div>
           </div>
           {pending && perm.admin && (
-            <div className="filters" style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #f0d2b2' }}>
+            <div className="filters" style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--warn-rule)' }}>
               {incident.priority !== 'Critical' && (
                 <label>New priority
                   <select className="input" style={{ minWidth: 160 }} value={field('escPriority', higher[0])} onChange={setField('escPriority')}>

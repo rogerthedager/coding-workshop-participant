@@ -155,3 +155,28 @@ describe('mobile More sheet', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });
+
+describe('theme toggle', () => {
+  afterEach(() => {
+    window.localStorage.removeItem('acme-theme');
+    delete document.documentElement.dataset.theme;
+  });
+
+  it('cycles System, Light and Dark and remembers the choice', async () => {
+    renderApp('/');
+    const toggle = await screen.findByRole('button', { name: /^Theme: System/ });
+
+    toggle.click();
+    await screen.findByRole('button', { name: /^Theme: Light/ });
+    expect(document.documentElement.dataset.theme).toBe('light');
+
+    screen.getByRole('button', { name: /^Theme: Light/ }).click();
+    await screen.findByRole('button', { name: /^Theme: Dark/ });
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(window.localStorage.getItem('acme-theme')).toBe('dark');
+
+    screen.getByRole('button', { name: /^Theme: Dark/ }).click();
+    await screen.findByRole('button', { name: /^Theme: System/ });
+    expect(window.localStorage.getItem('acme-theme')).toBe('system');
+  });
+});

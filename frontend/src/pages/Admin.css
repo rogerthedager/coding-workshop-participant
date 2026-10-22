@@ -1,6 +1,6 @@
 /* Shared bits for the admin set-up pages (teams, facilities). */
 .adm-stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-.adm-form { display: flex; flex-direction: column; gap: 14px; padding: 16px; border-top: 1px solid var(--line); background: #fafbfc; min-width: 0; }
+.adm-form { display: flex; flex-direction: column; gap: 14px; padding: 16px; border-top: 1px solid var(--line); background: var(--row-hover); min-width: 0; }
 .adm-form h3 { font-size: 14px; font-weight: 500; margin: 0; }
 .adm-intro { margin: 0; font-size: 14px; line-height: 1.5; color: var(--ink-2); }
 .adm-list { list-style: none; margin: 0; padding: 0; }
@@ -19,9 +19,9 @@
 .adm-check { display: flex; align-items: center; gap: 8px; min-height: 36px; font-size: 14px; font-weight: 400; flex-wrap: wrap; }
 .adm-check input { width: 18px; height: 18px; flex: none; }
 .adm-seats { display: flex; flex-wrap: wrap; gap: 4px; }
-.adm-seat { min-height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--ctl); background: #fff; color: var(--ink); font: 500 12px 'Roboto Mono', ui-monospace, monospace; cursor: pointer; }
+.adm-seat { min-height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--ctl); background: var(--surface); color: var(--ink); font: 500 12px 'Roboto Mono', ui-monospace, monospace; cursor: pointer; }
 .adm-seat.off { color: var(--muted); text-decoration: line-through; background: var(--gray-soft); }
-.adm-seat.on { background: var(--ink); color: #fff; border-color: var(--ink); text-decoration: none; }
+.adm-seat.on { background: var(--ink); color: var(--on-inverse); border-color: var(--ink); text-decoration: none; }
 .adm-preview { font-size: 13px; padding: 8px 12px; border-radius: 8px; background: var(--hover); overflow-wrap: anywhere; }
 .adm-codes { font-family: 'Roboto Mono', ui-monospace, monospace; font-size: 12px; overflow-wrap: anywhere; }
 .adm-toggle { border: 0; background: transparent; padding: 0; display: inline-flex; align-items: center; gap: 6px; font: 500 14px Roboto, sans-serif; color: var(--ink); cursor: pointer; min-height: 36px; text-align: left; overflow-wrap: anywhere; }

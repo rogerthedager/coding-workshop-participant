@@ -5,8 +5,23 @@ import { useAuth } from '../auth';
 import { initials, roleLabel } from '../format';
 import { useToast } from '../hooks';
 import { BellIcon, Icon, Toast } from './ui';
+import { setTheme, THEMES, useTheme } from '../theme';
 
 const POLL_MS = 30000;
+
+const THEME_INFO = { system: ['monitor', 'System'], light: ['sun', 'Light'], dark: ['moon', 'Dark'] };
+
+/** Cycles System → Light → Dark; the icon shows the current choice. */
+function ThemeButton() {
+  const theme = useTheme();
+  const next = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  const label = `Theme: ${THEME_INFO[theme][1]}. Switch to ${THEME_INFO[next][1]}`;
+  return (
+    <button type="button" className="btn sm" onClick={() => setTheme(next)} aria-label={label} title={label}>
+      <Icon name={THEME_INFO[theme][0]} size={18} />
+    </button>
+  );
+}
 
 function navItems({ isAdmin, isEngineer, isLead }) {
   const items = [
@@ -195,6 +210,7 @@ export default function Layout() {
             placeholder="Search by INC number, title or description" />
         </form>
         <div className="who">
+          <ThemeButton />
           <Link to="/notifications" className="btn sm bell" aria-label={bellLabel} title={bellLabel}>
             <BellIcon size={18} />
             {unread > 0 && <span className="badge" aria-hidden="true">{unread > 99 ? '99+' : unread}</span>}

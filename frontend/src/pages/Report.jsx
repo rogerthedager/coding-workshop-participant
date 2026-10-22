@@ -61,9 +61,9 @@ function Suggestions({ categoryId, floorId }) {
 
 const PRIORITIES = [
   ['Critical', 'var(--red)', 'Safety risk or the whole floor is affected.'],
-  ['High', '#8a4b00', 'Blocks a team or a booked room today.'],
+  ['High', 'var(--warn-ink)', 'Blocks a team or a booked room today.'],
   ['Medium', 'var(--blue-dark)', 'Annoying but there is a workaround.'],
-  ['Low', '#4a5261', 'Cosmetic, or can wait a week.'],
+  ['Low', 'var(--low-ink)', 'Cosmetic, or can wait a week.'],
 ];
 
 const EMPTY = { title: '', description: '', category_id: '', building_id: '', floor_id: '', seat_id: '', priority: 'Medium' };
@@ -225,7 +225,7 @@ export default function Report() {
       </div>
 
       {created ? (
-        <section className="card banner ok" role="status" style={{ padding: 24, background: '#f3fbf6', alignItems: 'flex-start' }}>
+        <section className="card banner ok" role="status" style={{ padding: 24, background: 'var(--good-bg)', alignItems: 'flex-start' }}>
           <span style={{ color: 'var(--green)' }}><Icon name="check" size={26} /></span>
           <div style={{ flex: '1 1 300px' }}>
             <h2 style={{ fontSize: 18, color: 'var(--green)' }}>{created.number} created</h2>

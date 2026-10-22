@@ -142,3 +142,30 @@ describe('"Move to" menu', () => {
     );
   });
 });
+
+describe('column limit', () => {
+  it('shows 15 cards per column, then reveals more on request', async () => {
+    const many = Array.from({ length: 20 }, (_, n) => incident({
+      id: `i-${n}`, number: `INC-${String(100 + n).padStart(4, '0')}`, status: 'Open', title: `Ticket ${n}`,
+    }));
+    boardApi();
+    server.use(http.get(`${API}/incidents`, ({ request }) => {
+      const statuses = new URL(request.url).searchParams.getAll('status');
+      return HttpResponse.json(page(many.filter((t) => statuses.includes(t.status))));
+    }));
+    renderApp('/board');
+    await screen.findByText('INC-0100');
+
+    const open = column('Open');
+    expect(within(open).getAllByRole('listitem')).toHaveLength(15);
+    expect(within(open).getByText('20')).toBeInTheDocument();
+    expect(within(open).getByText('Showing 15 of 20')).toBeInTheDocument();
+
+    fireEvent.click(within(open).getByRole('button', { name: 'Show 5 more in Open' }));
+    expect(within(open).getAllByRole('listitem')).toHaveLength(20);
+    expect(within(open).queryByRole('button', { name: /Show \d+ more/ })).not.toBeInTheDocument();
+
+    fireEvent.click(within(open).getByRole('button', { name: 'Show less in Open' }));
+    expect(within(open).getAllByRole('listitem')).toHaveLength(15);
+  });
+});

@@ -316,7 +316,7 @@ function AdminTab() {
             ['Open, unassigned', unassignedOpen?.count || 0, unassignedOpen?.href, null],
             ['In progress', count(data.status_counts, 'In Progress').count, count(data.status_counts, 'In Progress').href, null],
             ['Blocked', count(data.status_counts, 'Blocked').count, count(data.status_counts, 'Blocked').href, 'var(--red)'],
-            ['Pending escalations', data.pending_escalations.length, '/api/v1/incidents?escalation=Pending', '#8a4b00'],
+            ['Pending escalations', data.pending_escalations.length, '/api/v1/incidents?escalation=Pending', 'var(--warn-ink)'],
           ].map(([label, value, href, color]) => (
             <Link key={label} className="card stat" to={appHref(href)}>
               <div className="stat-label">{label}</div>
