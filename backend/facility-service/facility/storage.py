@@ -32,9 +32,22 @@ class S3Storage:
 
     def __init__(self, bucket: str, endpoint_url: str = "") -> None:
         import boto3
+        from botocore.config import Config
 
         self.bucket = bucket
-        self.client = boto3.client("s3", endpoint_url=endpoint_url or None)
+        if endpoint_url:
+            # S3-compatible server (MinIO) for local development.
+            self.client = boto3.client("s3", endpoint_url=endpoint_url)
+            return
+        # On AWS, sign against the regional endpoint: browsers cannot follow the
+        # redirect the global s3.amazonaws.com host returns for new non-us-east-1 buckets.
+        region = boto3.session.Session().region_name
+        self.client = boto3.client(
+            "s3",
+            region_name=region,
+            endpoint_url=f"https://s3.{region}.amazonaws.com" if region else None,
+            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        )
 
     def presign_post(self, key: str, content_type: str) -> dict:
         return self.client.generate_presigned_post(

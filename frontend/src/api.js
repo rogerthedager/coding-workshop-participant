@@ -1,7 +1,19 @@
 // Thin client for the facility-service API.
 // The access token lives only in memory; the refresh token is an HttpOnly cookie.
 
-const BASE = `${(import.meta.env.VITE_API_URL || '').replace(/\/$/, '')}/api/v1`;
+// In the cloud, CloudFront routes the service under its path from VITE_API_ENDPOINTS
+// (e.g. {"facility-service":"/api/facility-service"}); locally there is no prefix.
+function servicePrefix(raw) {
+  try {
+    return (JSON.parse(raw || '{}')['facility-service'] || '').replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+}
+
+const BASE = `${(import.meta.env.VITE_API_URL || '').replace(/\/$/, '')}${servicePrefix(
+  import.meta.env.VITE_API_ENDPOINTS,
+)}/api/v1`;
 
 let accessToken = null;
 let refreshing = null;
