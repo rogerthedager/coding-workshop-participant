@@ -216,8 +216,36 @@ def fixed_id(label: str):
     return uuid5(NAMESPACE_URL, "acme-facility-demo/" + label)
 
 
-async def seed(include_demo: bool = False, incidents: int = 0) -> dict:
-    """Insert missing categories/admin and optionally demo data without resetting records."""
+def demo_allowed() -> bool:
+    """Demo data goes only to the local dev DB, or a cloud DB whose owner opted in explicitly."""
+    if settings.is_local and settings.resolved_database_url().endswith("/acme_facility_dev"):
+        return True
+    if os.environ.get("FACILITY_ALLOW_DEMO_SEED") != "true":
+        return False
+    # Demo accounts include an admin, so a public deployment must not use the default password.
+    password = os.environ.get("DEMO_PASSWORD", "")
+    if (
+        len(password) < 10
+        or password == "DemoPass123!"
+        or not any(c.isalpha() for c in password)
+        or not any(c.isdigit() for c in password)
+        or len(password.encode()) > 72
+    ):
+        raise ValueError("Cloud demo seed needs a strong, non-default DEMO_PASSWORD")
+    return True
+
+
+async def seed(
+    include_demo: bool = False,
+    incidents: int = 0,
+    showcase: bool = False,
+    put_object=None,
+) -> dict:
+    """Insert missing categories/admin and optionally demo data without resetting records.
+
+    `showcase` tops every feature up to 10+ records; `put_object(key, bytes, type)` stores
+    the showcase photos (omit it to skip attachments).
+    """
     async with SessionLocal() as db:
         await db.execute(text("SELECT pg_advisory_xact_lock(624030120)"))
         added = 0
@@ -279,18 +307,29 @@ async def seed(include_demo: bool = False, incidents: int = 0) -> dict:
             )
             added += 1
         if include_demo:
-            if not settings.is_local or not settings.resolved_database_url().endswith(
-                "/acme_facility_dev"
-            ):
-                raise ValueError("Demo seed is restricted to local acme_facility_dev")
+            if not demo_allowed():
+                raise ValueError(
+                    "Demo seed is restricted to local acme_facility_dev "
+                    "(or FACILITY_ALLOW_DEMO_SEED=true with a strong DEMO_PASSWORD)"
+                )
             added += await seed_demo(db)
             await db.flush()
             added += await seed_teams(db)
             if incidents:
                 await db.flush()
                 added += await seed_bulk_incidents(db, incidents)
+            if showcase:
+                from facility.showcase import seed_showcase
+
+                await db.flush()
+                added += await seed_showcase(db, fixed_id, put_object)
         await db.commit()
-        return {"inserted": added, "demo": include_demo, "incidents": incidents}
+        return {
+            "inserted": added,
+            "demo": include_demo,
+            "incidents": incidents,
+            "showcase": showcase,
+        }
 
 
 async def seed_demo(db) -> int:
@@ -823,8 +862,33 @@ def main() -> None:
         metavar="N",
         help="also add N synthetic incident reports (implies --demo)",
     )
+    parser.add_argument(
+        "--showcase",
+        action="store_true",
+        help="top every feature up to 10+ records (implies --demo; use with --incidents)",
+    )
     args = parser.parse_args()
-    print(asyncio.run(seed(include_demo=args.demo or args.incidents > 0, incidents=args.incidents)))
+    put_object = None
+    if args.showcase and settings.attachments_bucket:
+        from facility.storage import S3Storage
+
+        client = S3Storage(settings.attachments_bucket, settings.attachments_endpoint_url).client
+
+        def put_object(key: str, body: bytes, content_type: str) -> None:
+            client.put_object(
+                Bucket=settings.attachments_bucket, Key=key, Body=body, ContentType=content_type
+            )
+
+    print(
+        asyncio.run(
+            seed(
+                include_demo=args.demo or args.incidents > 0 or args.showcase,
+                incidents=args.incidents,
+                showcase=args.showcase,
+                put_object=put_object,
+            )
+        )
+    )
 
 
 if __name__ == "__main__":
